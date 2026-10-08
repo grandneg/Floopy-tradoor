@@ -70,7 +70,6 @@
   <div class="side" id="sideL">
     <button id="tbEye" class="always" title="Look at the fly's dashboard (E)">👁</button>
     <button id="tbSound" title="Mute / unmute">🔊</button>
-    <button id="tbNext" title="Next streamer">⏭</button>
   </div>
   <div class="side" id="sideR">
     <button id="tbTv" title="Stream quality">📺</button>
@@ -1060,7 +1059,6 @@ setTimeout(() => document.getElementById('hint').classList.add('fade'), 12000);
 // touch bar (phones/tablets)
 const tb = id => document.getElementById(id);
 tb('tbSound').onclick = () => setMuted(soundOn ? !muted : false);
-tb('tbNext').onclick = hopNow;
 tb('tbTv').onclick = cycleQuality;
 tb('tbEye').onclick = toggleEye;
 tb('tbBrain').onclick = () => { brainVisible = !brainVisible; tb('tbBrain').classList.toggle('on', !brainVisible); };
