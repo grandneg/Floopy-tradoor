@@ -362,6 +362,20 @@ def fetch_hls(channel):
     return {"login": login, "live": bool(variants), "variants": variants, "checkedAt": int(time.time())}
 
 
+def hls_playlist(key):
+    """One variant's live media playlist, fetched by the server. Twitch binds a playback session to the IP that
+    opened it, so the viewer's browser can't load this playlist itself when the server lives elsewhere; the
+    video segments inside it are plain CDN URLs and are loaded directly by the viewer."""
+    login, height = key.split("|")
+    info, _ = cached_call(("/api/hls", login), 20, fetch_hls, login)
+    variants = info.get("variants") or []
+    if not variants:
+        raise ValueError("channel is offline")
+    want = int(height)
+    v = next((x for x in variants if x["height"] == want), None) or max((x for x in variants if x["height"] <= want), key=lambda x: x["height"], default=variants[0])
+    return get(v["url"])
+
+
 def fetch_token(mint):
     """Live stats for a Solana token from DexScreener (public, no key): best pair by liquidity."""
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", mint):
@@ -471,6 +485,17 @@ class Handler(SimpleHTTPRequestHandler):
             return self._file(PAGE, "text/html; charset=utf-8", "public, max-age=0, s-maxage=120")
         if parsed.path == "/healthz":
             return self._text(b"ok")
+        m = re.fullmatch(r"/hls/([a-z0-9_]{1,25})/(\d{2,4})\.m3u8", parsed.path)
+        if m:   # the live playlist, relayed for the viewer (see hls_playlist)
+            login, height = m.group(1), m.group(2)
+            if login not in ALLOWED["channels"]:
+                return self._json({"error": "not one of the streamers configured in fruit-fly-tv.html"}, 403)
+            try:
+                text, _ = cached_call(("/hls", f"{login}|{height}"), 1, hls_playlist, f"{login}|{height}")
+            except Exception as exc:
+                log(f"/hls {login}: ERROR {type(exc).__name__}: {exc}")
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 502)
+            return self._text(text.encode(), "application/vnd.apple.mpegurl", 200, "public, max-age=0, s-maxage=1")
         q = urllib.parse.parse_qs(parsed.query)
         if parsed.path in ("/api/brain", "/api/neuron"):
             try:
@@ -524,7 +549,7 @@ class Handler(SimpleHTTPRequestHandler):
 
     def log_message(self, fmt, *args):  # keep the console quiet: only report errors on static files
         text = " ".join(str(a) for a in args)
-        if "/api/" in text or "favicon.ico" in text:
+        if "/api/" in text or "/hls/" in text or "favicon.ico" in text:
             return
         if "404" in text or "code" in fmt:
             super().log_message(fmt, *args)

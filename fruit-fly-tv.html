@@ -631,7 +631,7 @@ async function loadChannel(ch) {
       toast(`${ch} is not live after all`); setTimeout(decide, 500); return;
     }
     variants = j.variants; const v = pickVariant(variants); qualityIdx = variants.indexOf(v);
-    playUrl(v.url);
+    playUrl(`/hls/${ch}/${v.height}.m3u8`);   // relayed by the server: Twitch ties the playlist to the server's IP
   } catch (err) {
     if (seq !== loadSeq) return;
     toast(`Couldn't get ${ch}'s stream (${err.message})`);
@@ -644,7 +644,7 @@ function cycleQuality() {
   qualityIdx = (qualityIdx + 1) % variants.length;
   const v = variants[qualityIdx];
   toast(`Quality: ${v.height}p${v.fps ? Math.round(v.fps) : ''} · ${v.kbps} kbps`);
-  playUrl(v.url);
+  playUrl(`/hls/${currentChannel}/${v.height}.m3u8`);
 }
 video.addEventListener('timeupdate', () => {
   if (video.currentTime > lastTime + 0.2) { lastTime = video.currentTime; lastProgressAt = performance.now(); reloads = 0; markPlaying(); }

@@ -57,10 +57,11 @@ You need a domain you own (a few dollars a year from any registrar; Cloudflare a
    bare domain). Render shows a CNAME target like `fruit-fly-tv.onrender.com`.
 3. **Cloudflare DNS**: add a `CNAME` record, name `fly` (or `@`), target that `…onrender.com` address,
    proxy status **Proxied** (orange cloud). Under *SSL/TLS* set the mode to **Full**.
-4. **Cache the polls**: *Caching → Cache Rules → Create rule*. Match `URI Path starts with /api/`,
-   set *Cache eligibility* to **Eligible for cache** and *Edge TTL* to **Use cache-control header from
-   origin**. That makes Cloudflare honour the `s-maxage` values (5–45 s for data, a week for brain files).
-   Optionally a second rule for the page itself (`URI Path equals /`) with the same settings.
+4. **Cache the polls**: *Caching → Cache Rules → Create rule*. Match `URI Path starts with /api/`
+   **or** `URI Path starts with /hls/`, set *Cache eligibility* to **Eligible for cache** and *Edge TTL* to
+   **Use cache-control header from origin**. That makes Cloudflare honour the `s-maxage` values (1 s for
+   the stream playlist, 5–45 s for data, a week for brain files). Optionally a second rule for the page
+   itself (`URI Path equals /`) with the same settings.
 5. Wait for the nameserver change (minutes to a day), then open `https://fly.yourdomain.com`.
 
 After editing the page or the coin, purge Cloudflare's cache (*Caching → Configuration → Purge
@@ -79,10 +80,12 @@ example to use `?coin=` links), set the environment variables `ALLOWED_COINS=add
   are stricter about autoplay and sound on http.
 - **Sound** still starts muted for every visitor until they tap once. Browsers require that.
 - **How the TV plays Twitch**: the server fetches each channel's stream playlist the way third-party
-  players do (an anonymous playback token from Twitch, then the playlist), and the browser streams the
-  video straight from Twitch's CDN with hls.js, drawing it onto the 3D screen. Video bandwidth does not
-  pass through the server. If Twitch changes that internal API the live check still works but the TV
-  will show the standby screen; the fix would be in `fetch_hls` in `serve.py`.
+  players do (an anonymous playback token from Twitch, then the playlist) and relays the small, constantly
+  refreshing playlist file to viewers (Twitch ties a playback session to the server's IP, so the browser
+  can't fetch it itself). The video segments named in that playlist are loaded by each viewer's browser
+  straight from Twitch's CDN with hls.js and drawn onto the 3D screen, so video bandwidth does not pass
+  through the server. If Twitch changes that internal API the live check still works but the TV will show
+  the standby screen; the fix would be in `fetch_hls` / `hls_playlist` in `serve.py`.
 - **Environment variables** (all optional): `PORT` (set by the host), `HOST` (bind address), `CACHE_DIR`
   (where the downloaded brain files go; a persistent disk avoids re-downloading after restarts).
 - **Changing the streamers or the coin**: edit the `STREAMERS` list and the `COIN` line near the top of
