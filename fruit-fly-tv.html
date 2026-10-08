@@ -664,6 +664,22 @@ setInterval(() => {
   }
 }, 2000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden && tvOn) setTimeout(() => video.play().catch(() => {}), 500); });
+// Ad breaks: without Twitch's own player, an ad break is a purple "preparing your stream" slate. When the
+// current streamer is in a long one and someone else is live, the fly channel-surfs instead of staring at it.
+let adHoppedFrom = null;
+every(async () => {
+  if (!tvOn || !currentChannel) return;
+  try {
+    const r = await fetch(`/api/adstate?channel=${currentChannel}`, { cache: 'no-store' }); const j = await r.json();
+    if (!r.ok || j.error) return;
+    const live = liveList();
+    if (j.adSecondsLeft > 25 && live.length > 1 && adHoppedFrom !== currentChannel && performance.now() - switchedAt > 20000) {
+      const s = liveStatus[currentChannel] || {};
+      toast(`ad break on ${s.name || currentChannel} — surfing on`);
+      adHoppedFrom = currentChannel; switchTo(pickNext(live));
+    } else if (!j.adSecondsLeft && adHoppedFrom === currentChannel) adHoppedFrom = null;
+  } catch {}
+}, 5000);
 
 // Sound: browsers only allow sound after the page has been tapped once, so the TV starts muted, unmutes on
 // the first tap (unless you muted it yourself) and stays that way across channel hops.

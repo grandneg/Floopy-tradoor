@@ -362,18 +362,71 @@ def fetch_hls(channel):
     return {"login": login, "live": bool(variants), "variants": variants, "checkedAt": int(time.time())}
 
 
+# A Twitch playback session (the set of variant playlist URLs usher hands out) must be kept for the whole
+# viewing: opening a new one restarts the stream for every viewer and begins with a pre-roll slate. So one
+# session per channel is held for hours and only reopened when Twitch rejects it.
+_sessions = {}      # login -> {"info": ..., "at": time}
+_adstate = {}       # login -> epoch seconds until which the stream is showing an ad slate
+SESSION_SECONDS = 4 * 3600
+_session_lock = threading.Lock()
+
+
+def hls_session(login, force=False):
+    with _session_lock:
+        s = _sessions.get(login)
+        if s and not force and time.time() - s["at"] < SESSION_SECONDS:
+            return s["info"]
+        info = fetch_hls(login)
+        if info.get("variants"):          # never remember "offline": the next ask should look again
+            _sessions[login] = {"info": info, "at": time.time()}
+        else:
+            _sessions.pop(login, None)
+        return info
+
+
+def note_ads(login, playlist):
+    """Remember until when the playlist is in a stitched-ad break (the purple 'preparing your stream' slate)."""
+    from datetime import datetime
+    until = 0
+    for m in re.finditer(r'#EXT-X-DATERANGE:[^\n]*CLASS="twitch-stitched-ad"[^\n]*', playlist):
+        line = m.group(0)
+        sd = re.search(r'START-DATE="([^"]+)"', line)
+        du = re.search(r"DURATION=([\d.]+)", line)
+        if sd and du:
+            try:
+                start = datetime.fromisoformat(sd.group(1).replace("Z", "+00:00")).timestamp()
+                until = max(until, start + float(du.group(1)))
+            except Exception:
+                pass
+    _adstate[login] = until
+
+
+def ad_state(login):
+    remaining = max(0, _adstate.get(login, 0) - time.time())
+    return {"login": login, "adSecondsLeft": int(remaining), "checkedAt": int(time.time())}
+
+
 def hls_playlist(key):
     """One variant's live media playlist, fetched by the server. Twitch binds a playback session to the IP that
     opened it, so the viewer's browser can't load this playlist itself when the server lives elsewhere; the
     video segments inside it are plain CDN URLs and are loaded directly by the viewer."""
     login, height = key.split("|")
-    info, _ = cached_call(("/api/hls", login), 20, fetch_hls, login)
-    variants = info.get("variants") or []
-    if not variants:
-        raise ValueError("channel is offline")
     want = int(height)
-    v = next((x for x in variants if x["height"] == want), None) or max((x for x in variants if x["height"] <= want), key=lambda x: x["height"], default=variants[0])
-    return get(v["url"])
+    for attempt in (0, 1):
+        info = hls_session(login, force=(attempt == 1))
+        variants = info.get("variants") or []
+        if not variants:
+            raise ValueError("channel is offline")
+        v = next((x for x in variants if x["height"] == want), None) or max((x for x in variants if x["height"] <= want), key=lambda x: x["height"], default=variants[0])
+        try:
+            text = get(v["url"])
+        except urllib.error.HTTPError as e:
+            if attempt == 0 and e.code in (403, 404, 410):   # Twitch dropped this session: open a fresh one
+                log(f"/hls {login}: session expired ({e.code}), reopening")
+                continue
+            raise
+        note_ads(login, text)
+        return text
 
 
 def fetch_token(mint):
@@ -467,7 +520,8 @@ def log(msg):
 
 API = {   # path -> (fetcher, query parameter, cache seconds, allowlist bucket)
     "/api/twitch": (fetch_twitch, "channels", TWITCH_CACHE_SECONDS, "channels"),
-    "/api/hls": (fetch_hls, "channel", 20, "channels"),
+    "/api/hls": (hls_session, "channel", 20, "channels"),
+    "/api/adstate": (ad_state, "channel", 2, "channels"),
     "/api/token": (fetch_token, "mint", TOKEN_CACHE_SECONDS, "coins"),
     "/api/chart": (fetch_chart, "mint", 15, "coins"),
     "/api/trades": (fetch_trades, "mint", 5, "coins"),
