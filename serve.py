@@ -1,16 +1,25 @@
-"""Serves the Fruit Fly TV page and answers two small JSON endpoints:
+"""Serves the Fruit Fly TV page and answers a few small JSON endpoints:
 
-  /api/live?handle=@channel    -> is the channel live right now (and which video)?
-  /api/videos?handle=@channel  -> the channel's uploads, for binge-watching while it is offline
+  /api/twitch?channels=a,b,c   -> which Twitch streamers are live (title, viewers)
+  /api/hls?channel=<login>     -> the channel's stream playlists (for the 3D TV)
+  /api/token?mint=<address>    -> live stats for a Solana token (DexScreener)
+  /api/chart, /api/trades      -> one-minute candles and recent trades (GeckoTerminal)
+  /api/brain, /api/neuron      -> connectome data (Virtual Fly Brain), cached on disk
 
-The browser cannot read youtube.com pages itself (cross-origin), so this little server does it.
-Run:  python serve.py   then open http://localhost:8765/fruit-fly-tv.html
+The browser cannot read those sites itself (cross-origin), so this little server does it.
+Only the coin, streamers and neurons configured in fruit-fly-tv.html are served (plus anything in the
+ALLOWED_COINS / ALLOWED_CHANNELS environment variables), so the server can't be used as an open relay.
+Every upstream result is cached and fetched once per expiry no matter how many viewers ask, and responses
+carry Cache-Control headers a CDN such as Cloudflare can use to serve viewers from its edge.
+Run:  python serve.py   then open http://localhost:8765/
 """
-import html
 import json
 import os
+import random
 import re
 import sys
+import threading
+import urllib.error
 import time
 import urllib.parse
 import urllib.request
@@ -19,83 +28,89 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 PORT = 8765
 HERE = os.path.dirname(os.path.abspath(__file__))
 PAGE = os.path.join(HERE, "fruit-fly-tv.html")
-LIVE_CACHE_SECONDS = 30
-VIDEOS_CACHE_SECONDS = 10 * 60
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-_cache = {}  # (kind, handle) -> (timestamp, result)
+SOL_MINT = "So11111111111111111111111111111111111111112"
 
 
 def get(url):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Accept-Language": "en-US,en;q=0.8",
-        "Cookie": "CONSENT=YES+cb; SOCS=CAI",   # skips the EU consent interstitial
-    })
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en-US,en;q=0.8"})
     with urllib.request.urlopen(req, timeout=20) as r:
         return r.read().decode("utf-8", "replace")
 
 
-def norm(handle):
-    handle = handle.strip()
-    return handle if handle.startswith("@") else "@" + handle
+# ---------------------------------------------------------------- shared cache: one upstream fetch per expiry
+_cache = {}          # key -> (timestamp, result)
+_inflight = {}       # key -> threading.Event while one thread is fetching it
+_cache_lock = threading.Lock()
 
 
-def fetch_live_status(handle):
-    handle = norm(handle)
-    page = get(f"https://www.youtube.com/{urllib.parse.quote(handle)}/live")
+def cached_call(key, ttl, fn, arg):
+    """Return (result, from_cache). The first request past expiry fetches; everyone else arriving meanwhile
+    waits for that one result instead of hitting upstream too. If upstream fails and an old copy exists,
+    the old copy is served and the next retry is held back for 5 seconds."""
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1], True
+        ev = _inflight.get(key)
+        leader = ev is None
+        if leader:
+            ev = _inflight[key] = threading.Event()
+    if not leader:
+        ev.wait(timeout=25)
+        with _cache_lock:
+            hit = _cache.get(key)
+        if hit:
+            return hit[1], True
+        raise RuntimeError("upstream fetch failed")
+    try:
+        result = fn(arg)
+        with _cache_lock:
+            _cache[key] = (time.time(), result)
+        return result, False
+    except Exception:
+        with _cache_lock:
+            hit = _cache.get(key)
+            if hit:
+                _cache[key] = (time.time() - ttl + 5, hit[1])
+        if hit:
+            log(f"{key[0]} {key[1]}: upstream failed, serving the last good copy")
+            return hit[1], True
+        raise
+    finally:
+        with _cache_lock:
+            _inflight.pop(key, None)
+        ev.set()
 
-    m = re.search(r'<link rel="canonical" href="([^"]+)"', page)
-    canonical = m.group(1) if m else ""
-    vm = re.search(r"[?&]v=([\w-]{11})", canonical)
-    video_id = vm.group(1) if vm else None
 
-    live_now = bool(re.search(r'"videoDetails":\{.*?"isLiveNow":true', page, re.S)) if video_id else False
-    sm = re.search(r'"scheduledStartTime":"(\d+)"', page)
-    tm = re.search(r'<meta name="title" content="([^"]*)"', page)
-    cm = re.search(r'"externalId":"(UC[\w-]{22})"', page)
-
-    return {
-        "handle": handle,
-        "channelId": cm.group(1) if cm else None,
-        "live": bool(video_id and live_now),
-        "upcoming": bool(video_id and not live_now),
-        "videoId": video_id,
-        "title": html.unescape(tm.group(1)) if tm else "",
-        "scheduledStart": int(sm.group(1)) if (sm and video_id and not live_now) else None,
-        "checkedAt": int(time.time()),
-    }
+# ---------------------------------------------------------------- what the page is allowed to ask for
+ALLOWED = {"coins": {SOL_MINT}, "channels": set(), "neurons": set()}
+_page_mtime = 0.0
 
 
-def fetch_videos(handle):
-    """Uploads from the channel's /videos tab (ids, newest first) plus titles from its RSS feed."""
-    handle = norm(handle)
-    page = get(f"https://www.youtube.com/{urllib.parse.quote(handle)}/videos")
-    cm = re.search(r'"externalId":"(UC[\w-]{22})"', page)
-    channel_id = cm.group(1) if cm else None
-
-    ids = []
-    for m in re.finditer(r'"videoId":"([\w-]{11})"', page):
-        if m.group(1) not in ids:
-            ids.append(m.group(1))
-
-    titles = {}
-    if channel_id:
-        try:
-            feed = get(f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}")
-            for e in re.finditer(r"<yt:videoId>([\w-]{11})</yt:videoId>\s*<yt:channelId>[^<]*</yt:channelId>\s*<title>([^<]*)</title>", feed):
-                titles[e.group(1)] = html.unescape(e.group(2))
-                if e.group(1) not in ids:
-                    ids.append(e.group(1))
-        except Exception:
-            pass
-
-    return {
-        "handle": handle,
-        "channelId": channel_id,
-        "videos": [{"id": i, "title": titles.get(i, "")} for i in ids],
-        "checkedAt": int(time.time()),
-    }
+def load_allowlist():
+    """Read the coin, streamers and neuron ids out of fruit-fly-tv.html (re-read whenever the file changes)."""
+    global _page_mtime
+    try:
+        mtime = os.path.getmtime(PAGE)
+    except OSError:
+        return
+    if mtime == _page_mtime:
+        return
+    _page_mtime = mtime
+    with open(PAGE, encoding="utf-8", errors="replace") as f:
+        src = f.read()
+    coins = set(re.findall(r"mint:\s*'([1-9A-HJ-NP-Za-km-z]{32,44})'", src))
+    coins |= {c.strip() for c in os.environ.get("ALLOWED_COINS", "").split(",") if c.strip()}
+    coins.add(SOL_MINT)
+    m = re.search(r"const STREAMERS\s*=\s*\[([^\]]*)\]", src)
+    channels = {c.lower() for c in re.findall(r"'([A-Za-z0-9_]{1,25})'", m.group(1))} if m else set()
+    channels |= {c.strip().lower() for c in os.environ.get("ALLOWED_CHANNELS", "").split(",") if c.strip()}
+    neurons = set(re.findall(r"id:\s*'(VFB_[0-9a-z]{8})'", src))
+    ALLOWED.update(coins=coins, channels=channels, neurons=neurons)
+    log(f"allowlist: {len(coins) - 1} coin(s), {len(channels)} streamer(s), {len(neurons)} neurons")
 
 
 # ---------------------------------------------------------------- connectome data (via Virtual Fly Brain)
@@ -267,6 +282,168 @@ def brain_obj(lod="full"):
     return data
 
 
+# ---------------------------------------------------------------- Twitch live status + coin data
+TWITCH_GQL = "https://gql.twitch.tv/gql"
+TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"   # the Twitch website's own public client id
+TWITCH_CACHE_SECONDS = 45
+TOKEN_CACHE_SECONDS = 10
+
+
+def fetch_twitch(channels):
+    """Which of these Twitch channels are live right now (title, viewers, category)."""
+    logins = [c.strip().lower() for c in channels.split(",") if re.fullmatch(r"[A-Za-z0-9_]{1,25}", c.strip())][:20]
+    if not logins:
+        raise ValueError("no channels")
+    query = ("query { users(logins: %s) { login displayName profileImageURL(width: 70) "
+             "stream { id title viewersCount createdAt game { displayName } } } }" % json.dumps(logins))
+    req = urllib.request.Request(TWITCH_GQL, data=json.dumps([{"query": query}]).encode(), headers={
+        "Client-Id": TWITCH_CLIENT_ID, "Content-Type": "application/json", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        data = json.loads(r.read().decode("utf-8", "replace"))
+    users = data[0]["data"]["users"]
+    streams = []
+    for login, u in zip(logins, users):
+        if not u:
+            streams.append({"login": login, "name": login, "live": False, "title": "", "viewers": 0, "game": ""})
+            continue
+        s = u.get("stream")
+        streams.append({
+            "login": u["login"], "name": u["displayName"], "avatar": u.get("profileImageURL"),
+            "live": bool(s), "title": s["title"] if s else "", "viewers": s["viewersCount"] if s else 0,
+            "game": ((s.get("game") or {}).get("displayName", "") if s else ""), "since": s["createdAt"] if s else None,
+        })
+    return {"streams": streams, "checkedAt": int(time.time())}
+
+
+def fetch_hls(channel):
+    """The channel's live HLS variants (resolution, bitrate, playlist url), the way third-party players get them:
+    an anonymous playback token from Twitch's GQL, then the master playlist from usher. The variant playlists
+    and segments themselves allow cross-origin loads, so the browser streams them directly with hls.js."""
+    login = channel.strip().lower()
+    if not re.fullmatch(r"[a-z0-9_]{1,25}", login):
+        raise ValueError("bad channel")
+    body = json.dumps({
+        "operationName": "PlaybackAccessToken",
+        "variables": {"isLive": True, "login": login, "isVod": False, "vodID": "", "playerType": "embed"},
+        "extensions": {"persistedQuery": {"version": 1, "sha256Hash": "0828119ded1c13477966434e15800ff57ddacf13ba1911c129dc2200705b0712"}},
+    }).encode()
+    req = urllib.request.Request(TWITCH_GQL, data=body, headers={
+        "Client-Id": TWITCH_CLIENT_ID, "Content-Type": "application/json", "User-Agent": UA,
+        "Device-ID": "".join(random.choices("abcdefghijklmnopqrstuvwxyz0123456789", k=32))})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        tok = json.loads(r.read().decode("utf-8", "replace"))["data"]["streamPlaybackAccessToken"]
+    if not tok:
+        return {"login": login, "live": False, "variants": []}
+    q = urllib.parse.urlencode({
+        "client_id": TWITCH_CLIENT_ID, "token": tok["value"], "sig": tok["signature"], "allow_source": "true",
+        "allow_audio_only": "true", "fast_bread": "true", "player_backend": "mediaplayer",
+        "playlist_include_framerate": "true", "reassignments_supported": "true", "p": random.randint(1000000, 9999999)})
+    req = urllib.request.Request(f"https://usher.ttvnw.net/api/channel/hls/{login}.m3u8?{q}", headers={"User-Agent": UA})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            master = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:   # usher answers 404 when the channel is offline
+            return {"login": login, "live": False, "variants": []}
+        raise
+    variants, info = [], None
+    for line in master.splitlines():
+        if line.startswith("#EXT-X-STREAM-INF"):
+            info = line
+        elif line.startswith("http") and info is not None:
+            res = re.search(r"RESOLUTION=(\d+)x(\d+)", info)
+            bw = re.search(r"BANDWIDTH=(\d+)", info)
+            fr = re.search(r"FRAME-RATE=([\d.]+)", info)
+            if res:   # skip audio-only
+                variants.append({"width": int(res.group(1)), "height": int(res.group(2)),
+                                 "kbps": int(bw.group(1)) // 1000 if bw else 0, "fps": float(fr.group(1)) if fr else 0, "url": line})
+            info = None
+    variants.sort(key=lambda v: v["height"])
+    return {"login": login, "live": bool(variants), "variants": variants, "checkedAt": int(time.time())}
+
+
+def fetch_token(mint):
+    """Live stats for a Solana token from DexScreener (public, no key): best pair by liquidity."""
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", mint):
+        raise ValueError("bad token address")
+    data = json.loads(get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}"))
+    pairs = data.get("pairs") or []
+    if not pairs:
+        raise ValueError("no trading pairs found for that token")
+    p = max(pairs, key=lambda x: ((x.get("liquidity") or {}).get("usd") or 0))
+    g = lambda *ks: (lambda d: [d := (d or {}).get(k) for k in ks][-1])(p)  # nested get
+    return {
+        "symbol": (p.get("baseToken") or {}).get("symbol", ""), "name": (p.get("baseToken") or {}).get("name", ""),
+        "priceUsd": float(p.get("priceUsd") or 0), "priceNative": float(p.get("priceNative") or 0),
+        "marketCap": p.get("marketCap") or p.get("fdv") or 0, "liquidityUsd": g("liquidity", "usd") or 0,
+        "volume24h": g("volume", "h24") or 0, "volume5m": g("volume", "m5") or 0,
+        "buys5m": g("txns", "m5", "buys") or 0, "sells5m": g("txns", "m5", "sells") or 0,
+        "change5m": g("priceChange", "m5") or 0, "change1h": g("priceChange", "h1") or 0, "change24h": g("priceChange", "h24") or 0,
+        "dex": p.get("dexId", ""), "pair": p.get("pairAddress", ""), "url": p.get("url", ""),
+        "checkedAt": int(time.time()),
+    }
+
+
+# ---------------------------------------------------------------- real candles + trades (GeckoTerminal, public API)
+GT = "https://api.geckoterminal.com/api/v2/networks/solana"
+_pools = {}   # mint -> (timestamp, pool address)
+
+
+def gt_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def gt_pool(mint):
+    """The token's main pool on GeckoTerminal (cached for 10 minutes)."""
+    if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", mint):
+        raise ValueError("bad token address")
+    hit = _pools.get(mint)
+    if hit and time.time() - hit[0] < 600:
+        return hit[1]
+    pools = gt_get(f"{GT}/tokens/{mint}/pools").get("data") or []
+    if not pools:
+        raise ValueError("GeckoTerminal has no pool for that token yet")
+    pool = pools[0]["attributes"]["address"]
+    _pools[mint] = (time.time(), pool)
+    return pool
+
+
+def fetch_chart(mint):
+    """Last 120 one-minute candles (USD): [timestamp, open, high, low, close, volume_usd], oldest first."""
+    pool = gt_pool(mint)
+    d = gt_get(f"{GT}/pools/{pool}/ohlcv/minute?aggregate=1&limit=120")
+    lst = d["data"]["attributes"]["ohlcv_list"]
+    candles = sorted(([int(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in lst), key=lambda c: c[0])
+    meta = d.get("meta", {})
+    return {"pool": pool, "base": (meta.get("base") or {}).get("symbol"), "candles": candles, "checkedAt": int(time.time())}
+
+
+def fetch_trades(mint):
+    """The most recent trades in the pool: side, USD size, token price, token amount, wallet."""
+    from datetime import datetime
+    pool = gt_pool(mint)
+    d = gt_get(f"{GT}/pools/{pool}/trades")
+    out = []
+    for t in (d.get("data") or [])[:80]:
+        a = t["attributes"]
+        sell = a.get("kind") == "sell"
+        try:
+            ts = int(datetime.fromisoformat(a["block_timestamp"].replace("Z", "+00:00")).timestamp())
+        except Exception:
+            ts = int(time.time())
+        out.append({
+            "ts": ts, "side": "sell" if sell else "buy",
+            "usd": float(a.get("volume_in_usd") or 0),
+            "price": float((a.get("price_from_in_usd") if sell else a.get("price_to_in_usd")) or 0),
+            "tokens": float((a.get("from_token_amount") if sell else a.get("to_token_amount")) or 0),
+            "wallet": a.get("tx_from_address") or "", "tx": a.get("tx_hash") or t.get("id"),
+        })
+    out.sort(key=lambda x: x["ts"], reverse=True)
+    return {"pool": pool, "trades": out, "checkedAt": int(time.time())}
+
+
 def log(msg):
     try:
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -274,59 +451,60 @@ def log(msg):
         pass
 
 
+API = {   # path -> (fetcher, query parameter, cache seconds, allowlist bucket)
+    "/api/twitch": (fetch_twitch, "channels", TWITCH_CACHE_SECONDS, "channels"),
+    "/api/hls": (fetch_hls, "channel", 20, "channels"),
+    "/api/token": (fetch_token, "mint", TOKEN_CACHE_SECONDS, "coins"),
+    "/api/chart": (fetch_chart, "mint", 15, "coins"),
+    "/api/trades": (fetch_trades, "mint", 5, "coins"),
+}
+
+
 class Handler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"   # keep-alive: viewers poll every few seconds, no need for a new connection each time
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
+        load_allowlist()
         # Only the page itself is public; the folder (server code, cache) is never listed or served.
         if parsed.path in ("/", "/index.html", "/fruit-fly-tv.html"):
-            return self._file(PAGE, "text/html; charset=utf-8")
+            return self._file(PAGE, "text/html; charset=utf-8", "public, max-age=0, s-maxage=120")
         if parsed.path == "/healthz":
             return self._text(b"ok")
+        q = urllib.parse.parse_qs(parsed.query)
         if parsed.path in ("/api/brain", "/api/neuron"):
-            q = urllib.parse.parse_qs(parsed.query)
             try:
                 if parsed.path == "/api/brain":
                     data = brain_obj(q.get("lod", ["full"])[0])
                 else:
-                    data = neuron_swc(q.get("id", [""])[0].strip(), q.get("max", ["3500"])[0])
+                    vid = q.get("id", [""])[0].strip()
+                    if vid not in ALLOWED["neurons"]:
+                        return self._json({"error": "that neuron is not part of this page"}, 403)
+                    data = neuron_swc(vid, q.get("max", ["3500"])[0])
             except Exception as exc:
                 log(f"{parsed.path}: ERROR {type(exc).__name__}: {exc}")
                 return self._json({"error": f"{type(exc).__name__}: {exc}"}, 502)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Cache-Control", "max-age=3600")
-            self.send_header("Content-Length", str(len(data)))
-            self.end_headers()
-            self.wfile.write(data)
-            return
-        if parsed.path not in ("/api/live", "/api/videos"):
-            return self._json({"error": "not found"}, 404)
-        handle = urllib.parse.parse_qs(parsed.query).get("handle", [""])[0].strip()
-        if not handle:
-            return self._json({"error": "missing handle"}, 400)
+            return self._text(data, "text/plain; charset=utf-8", 200, "public, max-age=86400, s-maxage=604800")
+        if parsed.path in API:
+            fn, param, ttl, bucket = API[parsed.path]
+            arg = q.get(param, [""])[0].strip()
+            if not arg:
+                return self._json({"error": f"missing {param}"}, 400)
+            wanted = {c.strip().lower() for c in arg.split(",") if c.strip()} if bucket == "channels" else {arg}
+            if not wanted or not wanted <= ALLOWED[bucket]:
+                return self._json({"error": "not one of the coins/streamers configured in fruit-fly-tv.html"}, 403)
+            try:
+                result, from_cache = cached_call((parsed.path, arg), ttl, fn, arg)
+            except Exception as exc:
+                log(f"{parsed.path} {arg}: ERROR {type(exc).__name__}: {exc}")
+                return self._json({"error": f"{type(exc).__name__}: {exc}"}, 502)
+            if parsed.path == "/api/twitch" and not from_cache:
+                log("twitch: " + ", ".join(f"{s['login']}={'LIVE ' + str(s['viewers']) if s['live'] else 'off'}" for s in result["streams"]))
+            return self._json(result, 200, f"public, max-age=0, s-maxage={ttl}, stale-while-revalidate=30")
+        return self._json({"error": "not found"}, 404)
 
-        kind = parsed.path.rsplit("/", 1)[1]
-        ttl = LIVE_CACHE_SECONDS if kind == "live" else VIDEOS_CACHE_SECONDS
-        key = (kind, handle.lower())
-        now = time.time()
-        cached = _cache.get(key)
-        if cached and now - cached[0] < ttl:
-            return self._json(cached[1])
-        try:
-            result = fetch_live_status(handle) if kind == "live" else fetch_videos(handle)
-        except Exception as exc:  # network trouble, YouTube layout change, etc.
-            log(f"{kind} {handle}: ERROR {type(exc).__name__}: {exc}")
-            return self._json({"error": f"{type(exc).__name__}: {exc}"}, 502)
-        _cache[key] = (now, result)
-        self._json(result)
-        if kind == "live":
-            state = "LIVE" if result["live"] else ("upcoming" if result["upcoming"] else "offline")
-            log(f"{handle}: {state} {result['videoId'] or ''} {result['title'][:60]}")
-        else:
-            log(f"{handle}: {len(result['videos'])} videos for binge-watching")
-
-    def _json(self, obj, status=200):
-        self._text(json.dumps(obj).encode(), "application/json", status, "no-store")
+    def _json(self, obj, status=200, cache="no-store"):
+        self._text(json.dumps(obj).encode(), "application/json", status, cache if status == 200 else "no-store")
 
     def _text(self, body, ctype="text/plain; charset=utf-8", status=200, cache="no-store"):
         self.send_response(status)
@@ -336,13 +514,13 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _file(self, path, ctype):
+    def _file(self, path, ctype, cache="no-cache"):
         try:
             with open(path, "rb") as f:
                 body = f.read()
         except OSError:
             return self._json({"error": "page missing"}, 500)
-        self._text(body, ctype, 200, "no-cache")
+        self._text(body, ctype, 200, cache)
 
     def log_message(self, fmt, *args):  # keep the console quiet: only report errors on static files
         text = " ".join(str(a) for a in args)
@@ -363,5 +541,8 @@ if __name__ == "__main__":
     # Host: 127.0.0.1 when run by hand on your own machine; all interfaces when a host sets PORT.
     port = int(sys.argv[1]) if len(sys.argv) > 1 else int(os.environ.get("PORT", PORT))
     host = os.environ.get("HOST") or ("0.0.0.0" if "PORT" in os.environ else "127.0.0.1")
+    load_allowlist()
     print(f"Fruit Fly TV  ->  http://localhost:{port}/   (Ctrl+C to stop)")
-    ThreadingHTTPServer((host, port), Handler).serve_forever()
+    server = ThreadingHTTPServer((host, port), Handler)
+    server.daemon_threads = True
+    server.serve_forever()

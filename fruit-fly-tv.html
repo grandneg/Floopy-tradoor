@@ -19,13 +19,14 @@
   #touchbar button { width:50px; height:50px; border-radius:50%; border:1px solid rgba(255,255,255,.18); background:rgba(10,10,20,.55); backdrop-filter:blur(8px); color:#fff; font-size:22px; line-height:1; padding:0; cursor:pointer; box-shadow:0 2px 10px rgba(0,0,0,.35); touch-action:manipulation; }
   #touchbar button:active { background:rgba(80,120,200,.6); }
   #touchbar button.on { background:rgba(255,212,121,.85); color:#000; }
-  @media (pointer: coarse) { #touchbar { display:block; } #hint .keys { display:none; } }
-  body.touch #touchbar { display:block; } body.touch #hint .keys { display:none; }
-  #css3d, #webgl { position:absolute; inset:0; }
-  #css3d { z-index:0; }
-  #webgl { z-index:1; }
-  #webgl.passthrough { pointer-events:none; }
-  #webgl.passthrough + #ui .hint-tv { display:inline; }
+  /* the eye button shows everywhere; the rest of the bar only on touch devices */
+  #touchbar { display:block; }
+  @media (pointer: fine) { body:not(.touch) #touchbar button:not(.always) { display:none; } }
+  @media (pointer: coarse) { #hint .keys { display:none; } }
+  body.touch #hint .keys { display:none; }
+  #webgl { position:absolute; inset:0; z-index:1; }
+  /* the live stream decodes in this off-screen <video>; the 3D TV shows it as a texture */
+  #tvvideo { position:fixed; left:-9999px; top:0; width:160px; height:90px; pointer-events:none; }
   #ui { position:absolute; z-index:2; top:12px; left:12px; display:flex; flex-wrap:wrap; gap:8px; align-items:center;
         background:rgba(14,12,24,.72); backdrop-filter: blur(10px); padding:10px 12px; border-radius:14px; border:1px solid rgba(255,255,255,.1);
         max-width: calc(100vw - 24px); box-sizing:border-box; }
@@ -52,15 +53,8 @@
   .hint-tv { display:none; color:#ffd479; }
   #toast { position:absolute; z-index:3; bottom:44px; left:50%; transform:translateX(-50%); background:rgba(0,0,0,.75); padding:8px 14px; border-radius:10px; font-size:13px; opacity:0; transition:opacity .3s; pointer-events:none; }
   #toast.show { opacity:1; }
-  /* The TV screen element that lives inside the 3D scene */
-  .tvscreen { width:640px; height:360px; background:#05070c; overflow:hidden; position:relative; }
-  .tvscreen iframe { width:640px; height:360px; border:0; display:block; }
-  .nosignal { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; color:#9fb3d9; font-size:22px; letter-spacing:.18em;
-              background: repeating-linear-gradient(0deg, rgba(255,255,255,.035) 0 2px, transparent 2px 4px), radial-gradient(ellipse at center, #151a2c, #05070c 70%); }
-  .nosignal small { font-size:13px; letter-spacing:.05em; opacity:.7; }
-  .nosignal .bars { display:flex; width:70%; height:26px; border-radius:4px; overflow:hidden; opacity:.5; }
-  .nosignal .bars i { flex:1; }
 </style>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
 <script type="importmap">
 { "imports": {
   "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
@@ -69,16 +63,17 @@
 </script>
 </head>
 <body>
-<div id="css3d"></div>
+<video id="tvvideo" playsinline muted crossorigin="anonymous"></video>
 <div id="webgl"></div>
-<div id="hint"><span id="soundHint">🔇 tap anywhere for sound · </span>drag to orbit · pinch or scroll to zoom<span class="keys"> · <b>M</b> mute · <b>N</b> next video · <b>T</b> click the TV · <b>F</b> fly · <b>B</b> brain</span></div>
+<div id="hint"><span id="soundHint">🔇 tap anywhere for sound · </span>drag to orbit · pinch or scroll to zoom<span class="keys"> · <b>E</b> dashboard view · <b>M</b> mute · <b>N</b> next streamer · <b>T</b> quality · <b>F</b> fly · <b>B</b> brain · <b>D</b> dashboard</span></div>
 <div id="touchbar">
   <div class="side" id="sideL">
+    <button id="tbEye" class="always" title="Look at the fly's dashboard (E)">👁</button>
     <button id="tbSound" title="Mute / unmute">🔊</button>
-    <button id="tbNext" title="Next video">⏭</button>
+    <button id="tbNext" title="Next streamer">⏭</button>
   </div>
   <div class="side" id="sideR">
-    <button id="tbTv" title="Tap the TV player">📺</button>
+    <button id="tbTv" title="Stream quality">📺</button>
     <button id="tbBrain" title="Brain hologram">🧠</button>
     <button id="tbFly" title="Take a lap">🪰</button>
   </div>
@@ -88,14 +83,18 @@
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { CSS3DRenderer, CSS3DObject } from 'three/addons/renderers/CSS3DRenderer.js';
 import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
 
 // ================================================================ CONFIG
-// The one YouTube channel the TV is tuned to. Change the handle (and the id, found on the
-// channel page as "externalId" / in the /channel/UC… URL) to watch a different channel.
-const CHANNEL = { handle: '@chokarella', id: 'UCnsj4aa0CVNpL54d5qLvgMw', name: 'Chokarella' };
-const CHECK_EVERY_SECONDS = 60;   // how often to ask whether the channel is live
+// The TV cycles through these Twitch streamers: it stays on whoever is live and hops to another live one
+// every few minutes (N / ⏭ hops right away).
+const STREAMERS = ['decu', 'dvces', 'cented', 'alxcooks', 'rasmrr'];
+const HOP_EVERY = [150, 330];     // seconds spent on one streamer before hopping (random in this range)
+const CHECK_EVERY_SECONDS = 60;   // how often to ask the helper server who is live
+// The fly's coin on his Axiom-style terminal. Leave `mint` empty for the simulated $FLY market, or paste a
+// Solana token address to show a real coin (price, market cap, volume from DexScreener; no login needed).
+const COIN = { symbol: 'FLY', name: 'Fruit Fly', supply: 1e9, mint: '7smcdS3cc3uNbD9wwTwRCfktSEvjKEntPwkw3ySypump' };
+// (a different coin for one session: add ?coin=<token address> to the URL; ?coin=sim shows the $FLY simulation)
 
 // The fly's brain: real neurons from the FlyWire whole-brain Drosophila connectome (FAFB, segmented with
 // Google Research's flood-filling networks), served by Virtual Fly Brain in JRC2018 template coordinates.
@@ -126,6 +125,7 @@ const GROUP_COLOR = { visual: 0x4fd8ff, flow: 0x37b6ff, escape: 0xffa040, steer:
 const params = new URLSearchParams(location.search);
 const forcedQuality = params.get('quality');
 const isTouch = matchMedia('(pointer: coarse)').matches || params.get('touch') === '1';
+if (params.get('coin')) COIN.mint = params.get('coin') === 'sim' ? '' : params.get('coin').trim();
 if (isTouch) document.body.classList.add('touch');
 const LOW = forcedQuality ? forcedQuality === 'low' : (isTouch || innerWidth < 700 || (navigator.hardwareConcurrency || 8) <= 4);
 const Q = LOW
@@ -157,10 +157,6 @@ glRenderer.toneMappingExposure = 1.05;
 glRenderer.outputColorSpace = THREE.SRGBColorSpace;
 const webglDiv = document.getElementById('webgl');
 webglDiv.appendChild(glRenderer.domElement);
-
-const cssRenderer = new CSS3DRenderer();
-cssRenderer.setSize(innerWidth, innerHeight);
-document.getElementById('css3d').appendChild(cssRenderer.domElement);
 
 const controls = new OrbitControls(camera, glRenderer.domElement);
 if (portrait) controls.target.set(-0.25, 1.05, -0.9); else controls.target.set(0.1, 0.95, 0.2);
@@ -206,6 +202,8 @@ function segment(a, b, r, mat, parent) {
 }
 const easeInOut = x => x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
 const rand = (a, b) => a + Math.random() * (b - a);
+// repeat fn roughly every ms, with ±15% jitter so thousands of viewers don't all poll the server in lockstep
+const every = (fn, ms) => { const tick = () => { fn(); setTimeout(tick, ms * rand(0.85, 1.15)); }; setTimeout(tick, ms * rand(0.85, 1.15)); };
 
 // ---------------------------------------------------------------- room
 const ROOM = { w: 10, h: 3.4, d: 9 };
@@ -300,38 +298,48 @@ const pendantLight = new THREE.PointLight(0xffe2b8, 7, 9, 2);
 pendantLight.position.set(0, ROOM.h - 0.75, 0.9); scene.add(pendantLight);
 
 // ---------------------------------------------------------------- TV + stand
-const TV = { x: 0, y: 1.2, z: -ROOM.d / 2 + 0.4, w: 1.6, h: 0.9 };
-box(2.6, 0.55, 0.5, darkWood, TV.x, 0.275, TV.z);                       // cabinet
-box(2.4, 0.02, 0.44, new THREE.MeshStandardMaterial({ color: 0x4a3a2a, roughness: 0.4 }), TV.x, 0.56, TV.z);
-box(0.7, 0.02, 0.3, new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.6, roughness: 0.3 }), TV.x, 0.57, TV.z);
-box(0.25, 0.14, 0.1, new THREE.MeshStandardMaterial({ color: 0x111111 }), TV.x, 0.64, TV.z);
-const tvFrame = box(TV.w + 0.12, TV.h + 0.12, 0.05, new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.35, metalness: 0.3 }), TV.x, TV.y, TV.z);
+const TV = { x: 0, y: 1.42, z: -ROOM.d / 2 + 0.4, w: 2.4, h: 1.35 };   // a 2.4 m wide screen
+box(3.2, 0.55, 0.5, darkWood, TV.x, 0.275, TV.z);                       // cabinet
+box(3.0, 0.02, 0.44, new THREE.MeshStandardMaterial({ color: 0x4a3a2a, roughness: 0.4 }), TV.x, 0.56, TV.z);
+box(0.9, 0.02, 0.3, new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.6, roughness: 0.3 }), TV.x, 0.57, TV.z);
+box(0.3, 0.16, 0.1, new THREE.MeshStandardMaterial({ color: 0x111111 }), TV.x, 0.66, TV.z);
+// The TV: a bezel, and a screen that shows the live video as a texture, so it is a real part of the room
+// (it foreshortens, the fly can pass in front of it, and it never follows the camera).
+box(TV.w + 0.12, TV.h + 0.12, 0.05, new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.35, metalness: 0.3 }), TV.x, TV.y, TV.z);
 sphere(0.008, new THREE.MeshBasicMaterial({ color: 0xff2020 }), TV.x + TV.w / 2 - 0.02, TV.y - TV.h / 2 - 0.035, TV.z + 0.026);
-// A "hole" in the WebGL layer so the CSS3D iframe underneath shows through
-const hole = new THREE.Mesh(new THREE.PlaneGeometry(TV.w, TV.h), new THREE.MeshBasicMaterial({ color: 0x000000, opacity: 0, blending: THREE.NoBlending, side: THREE.DoubleSide }));
-hole.position.set(TV.x, TV.y, TV.z + 0.027); scene.add(hole);
 
-// the screen element (placeholder until a link is loaded)
-const screenEl = document.createElement('div');
-screenEl.className = 'tvscreen';
-function showWaiting(sub) {
-  screenEl.innerHTML = `<div class="nosignal"><div class="pulse"></div>
-    <div>WAITING FOR ${CHANNEL.name.toUpperCase()}</div>
-    <small id="waitSub">${sub || 'checking whether the channel is live…'}</small>
-    <small>the TV switches to the stream by itself when the channel goes live</small></div>`;
+const video = document.getElementById('tvvideo');
+const videoTex = new THREE.VideoTexture(video);
+videoTex.colorSpace = THREE.SRGBColorSpace; videoTex.minFilter = THREE.LinearFilter; videoTex.magFilter = THREE.LinearFilter; videoTex.generateMipmaps = false;
+// standby picture for when nobody is live
+const standbyCanvas = document.createElement('canvas'); standbyCanvas.width = 640; standbyCanvas.height = 360;
+const standbyTex = new THREE.CanvasTexture(standbyCanvas); standbyTex.colorSpace = THREE.SRGBColorSpace;
+function drawStandby(sub) {
+  const g = standbyCanvas.getContext('2d');
+  const grad = g.createRadialGradient(320, 180, 20, 320, 180, 420); grad.addColorStop(0, '#151a2c'); grad.addColorStop(1, '#05070c');
+  g.fillStyle = grad; g.fillRect(0, 0, 640, 360);
+  g.fillStyle = 'rgba(255,255,255,0.035)'; for (let y = 0; y < 360; y += 4) g.fillRect(0, y, 640, 2);
+  g.fillStyle = '#ff3b3b'; g.beginPath(); g.arc(320, 128, 9, 0, Math.PI * 2); g.fill();
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillStyle = '#9fb3d9'; g.font = '600 26px system-ui, sans-serif'; g.fillText('N O B O D Y   I S   L I V E', 320, 178);
+  g.fillStyle = 'rgba(159,179,217,0.7)'; g.font = '15px system-ui, sans-serif';
+  g.fillText(sub || 'checking ' + STREAMERS.join(', ') + '…', 320, 218);
+  g.fillText('the TV switches on by itself when one of them goes live', 320, 244);
+  standbyTex.needsUpdate = true;
 }
+const screenMat = new THREE.MeshBasicMaterial({ map: standbyTex, toneMapped: false });
+const screen = new THREE.Mesh(new THREE.PlaneGeometry(TV.w, TV.h), screenMat);
+screen.position.set(TV.x, TV.y, TV.z + 0.027); scene.add(screen);
+function showVideoOnScreen(on) { const want = on ? videoTex : standbyTex; if (screenMat.map !== want) { screenMat.map = want; screenMat.needsUpdate = true; } }
+function showWaiting(sub) { drawStandby(sub); showVideoOnScreen(false); }
 showWaiting();
-const screenObj = new CSS3DObject(screenEl);
-screenObj.position.set(TV.x, TV.y, TV.z + 0.028);
-screenObj.scale.setScalar(TV.w / 640);
-scene.add(screenObj);
 
 // TV glow onto the room
 const tvLight = new THREE.PointLight(0x8fb0ff, 3, 7, 2);
 tvLight.position.set(TV.x, TV.y + 0.1, TV.z + 0.7); scene.add(tvLight);
 
 // soundbar + a plant next to the TV
-box(1.4, 0.08, 0.1, new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.6 }), TV.x, 0.62, TV.z + 0.18);
+box(2.0, 0.08, 0.1, new THREE.MeshStandardMaterial({ color: 0x1c1c1c, roughness: 0.6 }), TV.x, 0.62, TV.z + 0.18);
 const potMat = new THREE.MeshStandardMaterial({ color: 0xb35a3a, roughness: 0.8 });
 cyl(0.18, 0.14, 0.3, potMat, -2.6, 0.15, TV.z + 0.1);
 const leafMat = new THREE.MeshStandardMaterial({ color: 0x2f7a3a, roughness: 0.7, side: THREE.DoubleSide });
@@ -478,7 +486,7 @@ fly.group.position.copy(SEAT);
 // flight path: seat -> hover over the fruit bowl -> a lap of the room -> back to the seat
 const curve = new THREE.CatmullRomCurve3([
   SEAT.clone(), new THREE.Vector3(-0.45, 1.45, 1.0), new THREE.Vector3(0.05, 0.95, 0.12), new THREE.Vector3(0.0, 0.92, 0.05),
-  new THREE.Vector3(1.3, 1.6, -1.4), new THREE.Vector3(2.6, 2.3, 0.2), new THREE.Vector3(0.8, 2.5, 2.4), new THREE.Vector3(-1.6, 1.8, 2.6),
+  new THREE.Vector3(2.2, 2.2, -1.6), new THREE.Vector3(2.8, 2.3, 0.4), new THREE.Vector3(0.8, 2.5, 2.4), new THREE.Vector3(-1.6, 1.8, 2.6),
   new THREE.Vector3(-1.1, 1.3, 2.0), SEAT.clone()
 ], false, 'centripetal');
 
@@ -572,157 +580,463 @@ glRenderer.domElement.addEventListener('pointerup', e => {
 const toastEl = document.getElementById('toast'); let toastTimer;
 function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(() => toastEl.classList.remove('show'), 2600); }
 
-// ---------------------------------------------------------------- channel watcher
-// no on-screen panel any more: the status goes into the window title instead
+// ---------------------------------------------------------------- Twitch: who is live, channel hopping
+// no on-screen panel: the status goes into the window title instead
 function setStatus(kind, text) { document.title = (kind === 'live' ? '🔴 ' : '') + text; }
 const fmtTime = d => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+const fmtNum = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(Math.round(n));
 
-// mode: 'live' = the channel's stream is on, 'binge' = playing one of its uploads while waiting,
-//       'idle' = nothing on, 'fallback' = no helper server, using YouTube's channel-live embed
-let mode = 'idle', tvOn = false, iframe = null, currentVideo = null, playerState = -1;
-let playlist = [], queue = [], bingeVideo = null, nowPlayingTitle = '', mountedAt = 0, lastCheckStr = '', nextInfo = '';
-let lastFallbackLoad = 0, playlistError = '';
+let liveStatus = {};                 // login -> { live, name, title, viewers, game }
+let helperOk = null;                 // null = not asked yet, false = no helper server (hop blindly)
+let currentChannel = null, tvOn = false, tvPlaying = false, startingChannel = false, playingSince = 0, nextHopAt = 0, lastCheckStr = '';
+function markPlaying() { if (!tvPlaying) { playingSince = performance.now(); showVideoOnScreen(true); } tvPlaying = true; startingChannel = false; }
 
-function mountPlayer(src) {
-  iframe = document.createElement('iframe');
-  iframe.src = src;
-  iframe.allow = 'autoplay; encrypted-media; picture-in-picture; fullscreen';
-  iframe.referrerPolicy = 'strict-origin-when-cross-origin';
-  // ask the embedded player to report its state (0 ended, 1 playing, 2 paused, 3 buffering, 5 cued, -1 unstarted)
-  const listen = () => iframe && iframe.contentWindow && iframe.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), 'https://www.youtube.com');
-  iframe.addEventListener('load', () => { listen(); setTimeout(listen, 800); setTimeout(listen, 2500); });
-  playerState = -1; mountedAt = Date.now();
-  screenEl.innerHTML = ''; screenEl.appendChild(iframe);
+// ---- the stream itself: the helper server fetches the channel's HLS playlist (the way third-party players do),
+// hls.js feeds it into the hidden <video>, and the 3D screen shows that video as a texture.
+let hls = null, variants = [], qualityIdx = -1, switchedAt = 0, lastProgressAt = 0, lastTime = -1, loadSeq = 0, reloads = 0;
+const MAX_HEIGHT = LOW ? 480 : 720;   // tallest variant picked by default (T / 📺 cycles through all of them)
+function pickVariant(list) { const ok = list.filter(v => v.height <= MAX_HEIGHT); const pool = ok.length ? ok : list; return pool[pool.length - 1]; }
+function stopVideo() {
+  if (hls) { try { hls.destroy(); } catch {} hls = null; }
+  try { video.pause(); video.removeAttribute('src'); video.load(); } catch {}
+  tvPlaying = false;
 }
-// Sound: browsers only allow sound-on playback after the page has been clicked once, so the TV starts muted,
-// unmutes itself on the first click, and every later video comes on with sound straight away.
-let soundOn = false, muted = false;   // soundOn: the browser has let us unmute at least once; muted: the user's own choice
-const playerCmd = (func, args = []) => iframe && iframe.contentWindow && iframe.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
+function playUrl(url) {
+  if (hls) { try { hls.destroy(); } catch {} hls = null; }
+  lastTime = -1; lastProgressAt = performance.now();
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({ liveSyncDurationCount: 3, liveMaxLatencyDurationCount: 8, maxBufferLength: 14, enableWorker: true, backBufferLength: 10 });
+    hls.loadSource(url); hls.attachMedia(video);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { video.play().catch(() => {}); });
+    hls.on(Hls.Events.ERROR, (ev, data) => {
+      if (!data.fatal) return;
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
+      else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
+      else if (currentChannel) { toast('stream error — reloading'); loadChannel(currentChannel); }
+    });
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {   // Safari plays HLS natively
+    video.src = url; video.play().catch(() => {});
+  } else toast('This browser cannot play HLS streams.');
+}
+async function loadChannel(ch) {
+  const seq = ++loadSeq;
+  startingChannel = true; tvPlaying = false; switchedAt = performance.now(); lastProgressAt = performance.now();
+  try {
+    const r = await fetch(`/api/hls?channel=${encodeURIComponent(ch)}`, { cache: 'no-store' });
+    const j = await r.json();
+    if (seq !== loadSeq) return;   // a newer switch happened meanwhile
+    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+    if (!j.live || !j.variants.length) {
+      liveStatus[ch] = Object.assign({}, liveStatus[ch] || {}, { live: false });
+      toast(`${ch} is not live after all`); setTimeout(decide, 500); return;
+    }
+    variants = j.variants; const v = pickVariant(variants); qualityIdx = variants.indexOf(v);
+    playUrl(v.url);
+  } catch (err) {
+    if (seq !== loadSeq) return;
+    toast(`Couldn't get ${ch}'s stream (${err.message})`);
+    liveStatus[ch] = Object.assign({}, liveStatus[ch] || {}, { live: false });
+    setTimeout(decide, 3000);
+  }
+}
+function cycleQuality() {
+  if (!variants.length || !currentChannel) { toast('No stream playing'); return; }
+  qualityIdx = (qualityIdx + 1) % variants.length;
+  const v = variants[qualityIdx];
+  toast(`Quality: ${v.height}p${v.fps ? Math.round(v.fps) : ''} · ${v.kbps} kbps`);
+  playUrl(v.url);
+}
+video.addEventListener('timeupdate', () => {
+  if (video.currentTime > lastTime + 0.2) { lastTime = video.currentTime; lastProgressAt = performance.now(); reloads = 0; markPlaying(); }
+});
+video.addEventListener('ended', () => {   // the live playlist ended: the streamer went offline
+  if (currentChannel) { liveStatus[currentChannel] = Object.assign({}, liveStatus[currentChannel] || {}, { live: false }); tvPlaying = false; setTimeout(decide, 1000); }
+});
+// stall watchdog: a short stall gets a play() nudge, a long one reloads the stream, repeated ones hop on
+setInterval(() => {
+  if (!tvOn || !currentChannel || document.hidden) return;
+  const since = performance.now() - lastProgressAt;
+  if (tvPlaying && since > 4000) { tvPlaying = false; video.play().catch(() => {}); }
+  if (since > 30000) {
+    lastProgressAt = performance.now();
+    if (++reloads >= 3) { reloads = 0; const live = liveList(); if (live.length > 1) { toast('stream keeps stalling — hopping on'); switchTo(pickNext(live)); return; } }
+    toast('stream stalled — reloading'); loadChannel(currentChannel);
+  }
+}, 2000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && tvOn) setTimeout(() => video.play().catch(() => {}), 500); });
+
+// Sound: browsers only allow sound after the page has been tapped once, so the TV starts muted, unmutes on
+// the first tap (unless you muted it yourself) and stays that way across channel hops.
+let soundOn = false, muted = false;   // soundOn: the page has had a real tap; muted: the user's own choice
+function applySound() { video.muted = muted || !soundOn; video.volume = 1; }
 function enableSound() {
+  if (soundOn) return;
   soundOn = true;
   const sh = document.getElementById('soundHint'); if (sh) sh.remove();
-  if (!muted) { playerCmd('unMute'); playerCmd('setVolume', [100]); playerCmd('playVideo'); }
+  applySound(); if (tvOn) video.play().catch(() => {});
 }
 function setMuted(m) {
-  muted = m;
-  if (m) playerCmd('mute'); else { soundOn = true; playerCmd('unMute'); playerCmd('setVolume', [100]); playerCmd('playVideo'); }
+  muted = m; soundOn = true; applySound();
   const b = document.getElementById('tbSound'); b.textContent = m ? '🔇' : '🔊'; b.classList.toggle('on', m);
   toast(m ? 'Muted' : 'Sound on');
 }
 // the first tap anywhere (except on the buttons, which handle themselves) unlocks sound
 addEventListener('pointerdown', e => { if (!soundOn && !e.target.closest('#touchbar')) enableSound(); }, true);
 addEventListener('keydown', () => { if (!soundOn) enableSound(); }, true);
-if (navigator.userActivation && navigator.userActivation.hasBeenActive) enableSound();
 
-function onPlayerState(s) {
-  const prev = playerState; playerState = s;
-  if (s === 1 && soundOn && !muted) { playerCmd('unMute'); playerCmd('setVolume', [100]); }   // new video started -> sound on
-  if (s === 1 && muted) playerCmd('mute');
-  if (s === 0 && prev !== 0) {                 // finished
-    if (mode === 'binge') nextBinge();
-    else if (mode === 'live') checkLive();     // stream over -> re-check, then back to the binge
-  }
+function liveList() { return STREAMERS.filter(s => liveStatus[s] && liveStatus[s].live); }
+function pickNext(live) { const i = live.indexOf(currentChannel); return live[(i + 1) % live.length]; }
+function switchTo(ch) {
+  if (ch === currentChannel) return;
+  currentChannel = ch; tvOn = true; reloads = 0;
+  loadChannel(ch);
+  nextHopAt = performance.now() + rand(HOP_EVERY[0], HOP_EVERY[1]) * 1000;
+  const s = liveStatus[ch] || {};
+  toast(`📺 Switching to ${s.name || ch}${s.viewers ? ' · ' + fmtNum(s.viewers) + ' watching' : ''}`);
+  updateStatus();
 }
-addEventListener('message', e => {
-  let host; try { host = new URL(e.origin).hostname; } catch { return; }
-  if (!/(^|\.)youtube\.com$/.test(host)) return;
-  let d; try { d = JSON.parse(e.data); } catch { return; }
-  if (d.event === 'infoDelivery' && d.info) {
-    if ('playerState' in d.info) onPlayerState(d.info.playerState);
-    if (d.info.videoData && d.info.videoData.title && mode === 'binge') { nowPlayingTitle = d.info.videoData.title; updateStatus(); }
-  } else if (d.event === 'onStateChange') onPlayerState(d.info);
-  else if (d.event === 'onError' && mode === 'binge') setTimeout(nextBinge, 1500);   // unplayable upload -> skip it
-});
-const embedUrl = (path) => {
-  const origin = location.protocol.startsWith('http') ? `&origin=${encodeURIComponent(location.origin)}` : '';
-  return `https://www.youtube.com/embed/${path}autoplay=1&mute=1&rel=0&playsinline=1&enablejsapi=1${origin}`;
-};
+function decide() {
+  const live = liveList();
+  if (!live.length) {
+    if (tvOn) toast('Everyone went offline — waiting for the next stream.');
+    tvOn = false; currentChannel = null; stopVideo();
+    showWaiting(`${STREAMERS.join(', ')} are all offline · checked ${lastCheckStr || 'just now'}`);
+    updateStatus(); return;
+  }
+  if (!currentChannel || !live.includes(currentChannel)) switchTo(pickNext(live));
+  else if (live.length > 1 && performance.now() > nextHopAt) switchTo(pickNext(live));
+  else updateStatus();
+}
+function hopNow() {
+  const live = liveList();
+  if (!live.length) { toast('Nobody is live right now.'); return; }
+  if (live.length === 1 && currentChannel) { toast(`Only ${(liveStatus[currentChannel] || {}).name || currentChannel} is live right now.`); return; }
+  switchTo(pickNext(live));
+}
+async function checkStreams() {
+  try {
+    const r = await fetch(`/api/twitch?channels=${STREAMERS.join(',')}`, { cache: 'no-store' });
+    const j = await r.json(); if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+    for (const s of j.streams) liveStatus[s.login] = s;
+    helperOk = true; lastCheckStr = fmtTime(new Date());
+  } catch (err) {
+    // no helper server: nothing can play (the stream playlists come through it)
+    if (helperOk !== false) toast(`Can't reach the helper server (${err.message}) — start it with start-fly-tv.bat.`);
+    helperOk = false;
+  }
+  decide();
+}
 
 function updateStatus() {
-  if (mode === 'live') setStatus('live', `LIVE · ${nowPlayingTitle || CHANNEL.name}`);
-  else if (mode === 'binge') setStatus('wait', `${CHANNEL.name} is offline${nextInfo} · binge-watching: ${nowPlayingTitle || bingeVideo.id} · checked ${lastCheckStr}`);
-  else if (mode === 'idle') setStatus('wait', `${CHANNEL.name} is offline${nextInfo}${playlistError ? ' · ' + playlistError : ''} · checked ${lastCheckStr}`);
+  const s = currentChannel && liveStatus[currentChannel];
+  if (tvOn && s) setStatus('live', `${s.name || currentChannel} · ${fmtNum(s.viewers || 0)} viewers · ${s.title || ''}`);
+  else if (tvOn) setStatus('live', `watching ${currentChannel}`);
+  else setStatus('wait', `nobody is live · checked ${lastCheckStr || '…'}`);
 }
 
-function playLive(id, title) {
-  mountPlayer(embedUrl(`${id}?`));
-  mode = 'live'; currentVideo = id; tvOn = true; nowPlayingTitle = title || '';
-  updateStatus();
-  toast(`${CHANNEL.name} is live! Switching the TV over.`);
+// ---------------------------------------------------------------- the fly's trading terminal (Axiom-style hologram)
+let solUsd = 165;   // refreshed from DexScreener when the helper server is reachable
+const gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); while (!v) v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+const mkt = {
+  price: 0.000031, fair: 0.000031, candles: [], cur: null, period: 5, trades: [], holders: 1184, liqUsd: 9800, vol24: 52000,
+  regime: { kind: 'chop', drift: 0, vol: 0.05, until: 0 }, nextTrade: 0, real: null, chartReal: false, tradesReal: false, seenTx: new Set(),
+};
+const bag = { sol: 25, tokens: 0, cost: 0, realized: 0, bought: 0, sold: 0, trades: 0, nextDecision: 6 };
+let lastTrade = null;   // { t, kind: 'ape' | 'win' | 'rekt', side, sol, pnl }
+const WALLETS = ['7xKd…9fQ2', 'Gm3p…aZ1k', 'degen.sol', '4Lq9…Hh7u', 'bonk…420', 'Ej2r…m0Pz', 'cupsey', 'B1a7…x9Qs', 'ansem…fan', '9Hpd…Tt3w', 'DnM4…k8Lr', 'orangie', 'Fz5u…2Rqa'];
+const avgEntry = () => bag.tokens > 0 ? bag.cost * solUsd / bag.tokens : 0;   // USD per token
+const posValueSol = () => bag.tokens * mkt.price / solUsd;
+const upnl = () => posValueSol() - bag.cost;
+
+function pushTrade(side, sol, isFly) {
+  mkt.trades.unshift({ t: Date.now(), side, sol, usd: sol * solUsd, maker: isFly ? '🪰 the fly' : WALLETS[(Math.random() * WALLETS.length) | 0], fly: isFly });
+  if (mkt.trades.length > 40) mkt.trades.pop();
+  if (mkt.cur) mkt.cur.vol += sol;
+  if (!mkt.real) mkt.price *= 1 + (side === 'buy' ? 1 : -1) * Math.min(0.03, sol * 0.0025);
 }
-async function loadPlaylist() {
-  const r = await fetch(`/api/videos?handle=${encodeURIComponent(CHANNEL.handle)}`, { cache: 'no-store' });
-  const j = await r.json();
-  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
-  playlist = j.videos;
-  queue = [];
-}
-const shuffled = a => { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const k = Math.floor(Math.random() * (i + 1)); [a[i], a[k]] = [a[k], a[i]]; } return a; };
-function nextBinge() {
-  const pool = playlist.filter(v => v.id !== currentVideo);
-  if (!pool.length) { mode = 'idle'; tvOn = false; showWaiting('no uploads found to binge on'); updateStatus(); return; }
-  if (!queue.length) queue = shuffled(pool);
-  bingeVideo = queue.shift();
-  if (bingeVideo.id === currentVideo) bingeVideo = queue.shift() || pool[0];
-  mode = 'binge'; tvOn = true; nowPlayingTitle = bingeVideo.title || '';
-  mountPlayer(embedUrl(`${bingeVideo.id}?`));
-  updateStatus();
-}
-async function startBinge() {
-  try {
-    if (!playlist.length) await loadPlaylist();
-    playlistError = '';
-    nextBinge();
-  } catch (err) {
-    playlistError = `couldn't fetch the channel's videos (${err.message})`;
-    mode = 'idle'; tvOn = false; showWaiting(playlistError); updateStatus();
+function flyTrade(side, frac, t) {
+  if (side === 'buy') {
+    const sol = Math.min(bag.sol, Math.max(0.3, bag.sol * frac));
+    if (sol < 0.3) return;
+    bag.sol -= sol; bag.cost += sol; bag.tokens += sol * solUsd * 0.99 / mkt.price; bag.bought += sol; bag.trades++;
+    pushTrade('buy', sol, true);
+    lastTrade = { t, kind: 'ape', side, sol, pnl: 0 };
+    toast(`🪰 aped ${sol.toFixed(2)} SOL into $${mkt.real ? mkt.real.symbol : COIN.symbol}`);
+  } else {
+    const tok = bag.tokens * frac; if (tok <= 0) return;
+    const costPart = bag.cost * frac, proceeds = tok * mkt.price / solUsd * 0.99, pnl = proceeds - costPart;
+    bag.tokens -= tok; bag.cost -= costPart; bag.sol += proceeds; bag.realized += pnl; bag.sold += proceeds; bag.trades++;
+    if (bag.tokens < 1) { bag.tokens = 0; bag.cost = 0; }
+    pushTrade('sell', proceeds, true);
+    lastTrade = { t, kind: pnl >= 0 ? 'win' : 'rekt', side, sol: proceeds, pnl };
+    toast(pnl >= 0 ? `🪰 took profit: +${pnl.toFixed(2)} SOL` : `🪰 stopped out: ${pnl.toFixed(2)} SOL`);
   }
 }
-
-async function checkLive() {
-  try {
-    const r = await fetch(`/api/live?handle=${encodeURIComponent(CHANNEL.handle)}`, { cache: 'no-store' });
-    const j = await r.json();
-    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
-    lastCheckStr = fmtTime(new Date());
-    nextInfo = j.upcoming && j.scheduledStart
-      ? ` · next stream ${new Date(j.scheduledStart * 1000).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })}`
-      : '';
-    if (j.live && j.videoId) {
-      if (mode !== 'live' || currentVideo !== j.videoId) playLive(j.videoId, j.title);
-      else { nowPlayingTitle = j.title || nowPlayingTitle; updateStatus(); }
+function tickMarket(t, dt) {
+  const r = mkt.regime;
+  if (t > r.until) {
+    const k = Math.random();
+    if (k < 0.55) Object.assign(r, { kind: 'chop', drift: 0, vol: 0.05, until: t + rand(8, 30) });
+    else if (k < 0.8) Object.assign(r, { kind: 'pump', drift: rand(0.03, 0.08), vol: 0.09, until: t + rand(5, 18) });
+    else Object.assign(r, { kind: 'dump', drift: -rand(0.03, 0.09), vol: 0.1, until: t + rand(4, 14) });
+  }
+  if (mkt.real) {   // real coin: ease toward the last quote, with a little jitter so the chart breathes
+    mkt.price += (mkt.real.priceUsd - mkt.price) * Math.min(1, dt * 0.4);
+    mkt.price *= 1 + gauss() * 0.0015 * Math.sqrt(dt);
+  } else {
+    mkt.fair *= 1 + 0.004 * dt;   // slow upward drift so the fly's bag isn't doomed
+    const pull = Math.log(mkt.fair / mkt.price) * 0.08;
+    mkt.price = Math.max(1e-7, mkt.price * Math.exp((r.drift + pull) * dt + r.vol * Math.sqrt(dt) * gauss()));
+  }
+  if (mkt.real) {
+    // real coin: one-minute candles come from the exchange data (pollChart); between polls the live candle
+    // follows the latest quote so the chart keeps moving
+    if (mkt.chartReal) {
+      const minute = Math.floor(Date.now() / 60000) * 60;
+      if (!mkt.cur || mkt.cur.ts !== minute) {
+        if (mkt.cur) mkt.candles.push(mkt.cur);
+        if (mkt.candles.length > 200) mkt.candles.shift();
+        mkt.cur = { ts: minute, o: mkt.price, h: mkt.price, l: mkt.price, c: mkt.price, vol: 0 };
+      }
+      mkt.cur.c = mkt.price; mkt.cur.h = Math.max(mkt.cur.h, mkt.price); mkt.cur.l = Math.min(mkt.cur.l, mkt.price);
+    }
+  } else {
+    const slot = Math.floor(t / mkt.period);
+    if (!mkt.cur || mkt.cur.slot !== slot) {
+      if (mkt.cur) mkt.candles.push(mkt.cur);
+      if (mkt.candles.length > 90) mkt.candles.shift();
+      mkt.cur = { slot, o: mkt.price, h: mkt.price, l: mkt.price, c: mkt.price, vol: 0 };
+    }
+    mkt.cur.c = mkt.price; mkt.cur.h = Math.max(mkt.cur.h, mkt.price); mkt.cur.l = Math.min(mkt.cur.l, mkt.price);
+  }
+  if (t > mkt.nextTrade && !(mkt.real && mkt.tradesReal)) {   // other people's trades (real coin: paced from 5m stats until the live feed arrives)
+    const R = mkt.real;
+    const buyP = R ? (R.buys5m + 1) / (R.buys5m + R.sells5m + 2) : 0.5 + Math.max(-0.3, Math.min(0.3, r.drift * 4));
+    let sol;
+    if (R) {
+      const n = R.buys5m + R.sells5m, avgUsd = n > 0 ? R.volume5m / n : 20;
+      sol = Math.min(200, Math.max(0.01, avgUsd / solUsd * Math.exp(gauss() * 0.9)));
+      mkt.nextTrade = t + Math.min(4, Math.max(0.12, 300 / Math.max(1, n))) * rand(0.5, 1.5);
     } else {
-      if (mode === 'live') { currentVideo = null; mode = 'idle'; toast(`${CHANNEL.name} went offline — back to the binge.`); }
-      if (mode !== 'binge') await startBinge();
-      else updateStatus();
+      sol = Math.min(40, Math.max(0.05, Math.exp(gauss() - 0.3)));
+      mkt.nextTrade = t + rand(0.25, 2.2);
+      if (Math.random() < 0.3) mkt.holders++; mkt.vol24 += sol * solUsd;
     }
-  } catch (err) {
-    // No helper server (page opened straight from disk, or plain static hosting). Fall back to YouTube's own
-    // "channel live" embed, which shows the stream whenever the channel is live; reload it while nothing plays.
-    const playing = playerState === 1 || playerState === 3;
-    if (mode !== 'fallback' || (!playing && Date.now() - lastFallbackLoad > 3 * 60 * 1000)) {
-      mode = 'fallback'; lastFallbackLoad = Date.now(); currentVideo = null; tvOn = true;
-      mountPlayer(embedUrl(`live_stream?channel=${CHANNEL.id}&`));
-    }
-    setStatus('warn', `Can't reach the helper server (${err.message}) — start with start-fly-tv.bat for live-checking and binge mode.`);
+    pushTrade(Math.random() < buyP ? 'buy' : 'sell', sol, false);
+  }
+  if (t > bag.nextDecision) {   // the fly's own decisions: buy dips, take profit, cut losses, fomo into pumps
+    bag.nextDecision = t + rand(4, 12);
+    const closes = mkt.candles.slice(-12).map(c => c.c);
+    const sma = closes.length ? closes.reduce((a, b) => a + b, 0) / closes.length : mkt.price;
+    const entry = avgEntry();
+    if (bag.tokens > 0 && mkt.price < entry * 0.8) flyTrade('sell', 1, t);
+    else if (bag.tokens > 0 && mkt.price > entry * 1.12) flyTrade('sell', 0.5, t);
+    else if (bag.sol > 1 && mkt.price < sma * 0.985 && (bag.tokens === 0 || mkt.price < entry * 0.95)) flyTrade('buy', rand(0.15, 0.35), t);
+    else if (bag.sol > 2 && r.kind === 'pump' && Math.random() < 0.35) flyTrade('buy', rand(0.1, 0.25), t);
   }
 }
-// binge watchdog: an upload that never starts (premiere countdown, blocked embed, ...) gets skipped
-setInterval(() => {
-  if (mode === 'binge' && ![1, 2, 3].includes(playerState) && Date.now() - mountedAt > 45000) nextBinge();
-}, 5000);
+async function pollRealCoin() {
+  if (!COIN.mint) return;
+  try {
+    const r = await fetch(`/api/token?mint=${COIN.mint}`, { cache: 'no-store' }); const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+    if (!mkt.real) {   // first quote: restart the chart at the real price (unless the real candles already arrived)
+      if (!mkt.chartReal) { mkt.price = j.priceUsd; mkt.fair = j.priceUsd; mkt.candles = []; mkt.cur = null; }
+      if (!mkt.tradesReal) mkt.trades = mkt.trades.filter(tr => tr.fly);
+    }
+    mkt.real = j; mkt.liqUsd = j.liquidityUsd; mkt.vol24 = j.volume24h;
+  } catch (e) { console.warn('token data:', e.message); if (!mkt.real) realError = e.message; }
+}
+let realError = '';
+// real one-minute candles (USD) for the coin's pool
+async function pollChart() {
+  if (!COIN.mint) return;
+  try {
+    const r = await fetch(`/api/chart?mint=${COIN.mint}`, { cache: 'no-store' }); const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+    const nowMin = Math.floor(Date.now() / 60000) * 60;
+    const list = j.candles || [];
+    if (!list.length) return;
+    mkt.candles = list.filter(c => c[0] < nowMin).map(([ts, o, h, l, c, v]) => ({ ts, o, h, l, c, vol: v })).slice(-150);
+    const last = list[list.length - 1];
+    const lastClose = last[4];
+    if (!mkt.chartReal) { mkt.price = lastClose; mkt.fair = lastClose; }
+    if (mkt.real) mkt.real.priceUsd = lastClose;   // the newest trade price beats the 10 s quote
+    mkt.cur = last[0] === nowMin
+      ? { ts: nowMin, o: last[1], h: Math.max(last[2], mkt.price), l: Math.min(last[3], mkt.price), c: mkt.price, vol: last[5] }
+      : null;   // the tick starts a fresh candle for this minute
+    mkt.chartReal = true;
+  } catch (e) { console.warn('chart:', e.message); if (!mkt.chartReal) setTimeout(pollChart, 5000); }   // first load hit a rate limit: retry soon
+}
+// the pool's real trades, newest first
+async function pollTrades() {
+  if (!COIN.mint) return;
+  try {
+    const r = await fetch(`/api/trades?mint=${COIN.mint}`, { cache: 'no-store' }); const j = await r.json();
+    if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+    const fresh = (j.trades || []).filter(tr => !mkt.seenTx.has(tr.tx));
+    if (!mkt.tradesReal) mkt.trades = mkt.trades.filter(tr => tr.fly);   // drop the paced placeholders
+    for (const tr of fresh.slice(0, 40).reverse()) {
+      mkt.seenTx.add(tr.tx);
+      mkt.trades.unshift({ t: tr.ts * 1000, side: tr.side, sol: tr.usd / solUsd, usd: tr.usd, maker: tr.wallet ? tr.wallet.slice(0, 4) + '…' + tr.wallet.slice(-4) : '—', fly: false, price: tr.price });
+      if (mkt.cur && mkt.chartReal && tr.ts >= mkt.cur.ts) mkt.cur.vol += tr.usd;
+    }
+    mkt.trades.sort((a, b) => b.t - a.t);
+    if (mkt.trades.length > 60) mkt.trades.length = 60;
+    if (mkt.seenTx.size > 2000) mkt.seenTx = new Set([...mkt.seenTx].slice(-1000));
+    if (fresh.length && fresh[0].price > 0 && mkt.real) mkt.real.priceUsd = fresh[0].price;   // newest trade = newest price
+    mkt.tradesReal = true;
+  } catch (e) { console.warn('trades:', e.message); }
+}
+pollChart(); setTimeout(pollTrades, 2500); every(pollChart, 20000); every(pollTrades, 6000);   // ~13 upstream calls/min, under GeckoTerminal's free limit
+async function pollSol() {
+  try { const j = await (await fetch('/api/token?mint=So11111111111111111111111111111111111111112', { cache: 'no-store' })).json(); if (j.priceUsd > 1) solUsd = j.priceUsd; } catch {}
+}
+pollSol(); pollRealCoin(); every(pollRealCoin, 10000); every(pollSol, 120000);
 
-function skipVideo() { if (mode === 'binge') nextBinge(); else if (mode === 'live') toast(`${CHANNEL.name} is live right now — no skipping that!`); else startBinge(); }
-let tvMode = false;
-function setTvMode(on) {
-  tvMode = on; webglDiv.classList.toggle('passthrough', on); controls.enabled = !on;
-  toast(on ? (isTouch ? 'TV mode: taps go to the player (tap 📺 again to go back)' : 'TV mode: clicks go to the player (press T again to go back to orbiting)') : 'Back to orbiting');
+// the hologram panel floating in front of the fly, projected from a puck on the coffee table
+const DASH = { w: 1024, h: 640 };
+const dashCanvas = document.createElement('canvas'); dashCanvas.width = DASH.w; dashCanvas.height = DASH.h;
+const dashTex = new THREE.CanvasTexture(dashCanvas); dashTex.colorSpace = THREE.SRGBColorSpace; dashTex.anisotropy = 8;
+const dash = new THREE.Mesh(new THREE.PlaneGeometry(1.0, 0.625), new THREE.MeshBasicMaterial({ map: dashTex, transparent: true, side: THREE.DoubleSide, depthWrite: false }));
+dash.position.set(-0.56, 0.9, 0.62); dash.rotation.x = -0.72; dash.renderOrder = 2; scene.add(dash);
+let dashVisible = true;
+cyl(0.05, 0.06, 0.02, new THREE.MeshStandardMaterial({ color: 0x101418, metalness: 0.6, roughness: 0.3 }), -0.5, 0.485, 0.24);
+sphere(0.012, new THREE.MeshBasicMaterial({ color: 0x3fffc8 }), -0.5, 0.5, 0.24);
+const dashBeamGeo = new THREE.ConeGeometry(0.55, 0.5, 4, 1, true); dashBeamGeo.rotateX(Math.PI); dashBeamGeo.translate(0, 0.25, 0); dashBeamGeo.rotateY(Math.PI / 4);
+const dashBeam = new THREE.Mesh(dashBeamGeo, new THREE.MeshBasicMaterial({ color: 0x3fffc8, transparent: true, opacity: 0.045, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+dashBeam.position.set(-0.5, 0.5, 0.24);
+dashBeam.quaternion.setFromUnitVectors(_up, new THREE.Vector3(-0.06, 0.4, 0.38).normalize()); scene.add(dashBeam);
+const dashLight = new THREE.PointLight(0x3fffc8, 0.9, 2.5, 2); dashLight.position.set(-0.56, 0.95, 0.8); scene.add(dashLight);
+
+const G = dashCanvas.getContext('2d');
+const UP = '#19d27c', DOWN = '#ff4d6d', TXT = '#e8eef9', DIM = 'rgba(232,238,249,0.55)', LINE = 'rgba(255,255,255,0.08)';
+const fmtPrice = p => p >= 1 ? '$' + p.toFixed(2) : p >= 0.01 ? '$' + p.toFixed(4) : p >= 1e-6 ? '$' + p.toPrecision(3) : '$' + p.toExponential(2);
+function roundRect(x, y, w, h, r, fill, stroke) { G.beginPath(); G.roundRect(x, y, w, h, r); if (fill) { G.fillStyle = fill; G.fill(); } if (stroke) { G.strokeStyle = stroke; G.lineWidth = 1.5; G.stroke(); } }
+function text(s, x, y, size, color, align = 'left', weight = '') { G.font = `${weight} ${size}px system-ui, -apple-system, Segoe UI, sans-serif`; G.fillStyle = color; G.textAlign = align; G.textBaseline = 'middle'; G.fillText(s, x, y); }
+function drawChart(x, y, w, h) {
+  const all = mkt.candles.concat(mkt.cur ? [mkt.cur] : []).slice(-60);
+  let tx = x + 4;
+  const activeTf = mkt.real ? '1m' : '5s';
+  for (const tf of ['1s', '5s', '15s', '1m']) { const on = tf === activeTf; if (on) roundRect(tx - 4, y - 2, 34, 20, 5, 'rgba(255,255,255,0.1)'); text(tf, tx + 13, y + 8, 12, on ? '#fff' : DIM, 'center', on ? '700' : ''); tx += 40; }
+  text(`$${mkt.real ? mkt.real.symbol : COIN.symbol}/USD · ${mkt.real ? (mkt.chartReal ? 'live 1m candles · GeckoTerminal' : 'loading candles…') : 'simulated market'}`, x + w, y + 8, 12, DIM, 'right');
+  if (!all.length) return;
+  const cy = y + 26, ch = h - 26 - 54, vy = y + h - 50, vh = 46, cw = (w - 70) / 60;
+  let lo = Infinity, hi = -Infinity, vmax = 0; for (const c of all) { lo = Math.min(lo, c.l); hi = Math.max(hi, c.h); vmax = Math.max(vmax, c.vol); }
+  const pad = (hi - lo) * 0.08 || hi * 0.01; lo -= pad; hi += pad;
+  const py = p => cy + (1 - (p - lo) / (hi - lo)) * ch;
+  G.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) { const yy = cy + ch * i / 4; G.strokeStyle = LINE; G.beginPath(); G.moveTo(x, yy); G.lineTo(x + w - 70, yy); G.stroke(); text(fmtPrice(hi - (hi - lo) * i / 4), x + w - 64, yy, 11, DIM); }
+  all.forEach((c, i) => {
+    const cxp = x + (i + 60 - all.length) * cw + cw / 2, col = c.c >= c.o ? UP : DOWN;
+    G.strokeStyle = col; G.fillStyle = col;
+    G.beginPath(); G.moveTo(cxp, py(c.h)); G.lineTo(cxp, py(c.l)); G.stroke();
+    G.fillRect(cxp - cw * 0.32, py(Math.max(c.o, c.c)), cw * 0.64, Math.max(1.5, Math.abs(py(c.o) - py(c.c))));
+    const vb = vmax ? c.vol / vmax * vh : 0; G.globalAlpha = 0.45; G.fillRect(cxp - cw * 0.32, vy + vh - vb, cw * 0.64, vb); G.globalAlpha = 1;
+  });
+  if (mkt.real) {   // time axis
+    all.forEach((c, i) => {
+      if (!c.ts || c.ts % 600 !== 0) return;
+      const cxp = x + (i + 60 - all.length) * cw + cw / 2;
+      G.fillStyle = 'rgba(255,255,255,0.1)'; G.fillRect(cxp, cy, 1, ch);
+      text(new Date(c.ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), cxp, y + h - 4 - 46 - 8, 10, DIM, 'center');
+    });
+  }
+  const lp = py(mkt.price), last = all[all.length - 1];
+  G.setLineDash([4, 4]); G.strokeStyle = 'rgba(255,255,255,0.35)'; G.beginPath(); G.moveTo(x, lp); G.lineTo(x + w - 70, lp); G.stroke(); G.setLineDash([]);
+  roundRect(x + w - 68, lp - 10, 66, 20, 4, last.c >= last.o ? UP : DOWN); text(fmtPrice(mkt.price), x + w - 35, lp, 11, '#061018', 'center', '700');
+  if (bag.tokens > 0) {
+    const ey = py(avgEntry());
+    if (ey > cy && ey < cy + ch) { G.setLineDash([2, 6]); G.strokeStyle = '#ffd166'; G.beginPath(); G.moveTo(x, ey); G.lineTo(x + w - 70, ey); G.stroke(); G.setLineDash([]); text('🪰 entry', x + 6, ey - 9, 11, '#ffd166'); }
+  }
+}
+function drawTrades(x, y, w, h) {
+  text(mkt.real ? (mkt.tradesReal ? 'Trades · live' : 'Trades · loading…') : 'Trades', x, y + 8, 13, DIM, 'left', '700');
+  const now = Date.now();
+  mkt.trades.slice(0, 12).forEach((tr, i) => {
+    const ry = y + 34 + i * 24, col = tr.side === 'buy' ? UP : DOWN;
+    if (tr.fly) roundRect(x - 6, ry - 11, w + 6, 22, 5, 'rgba(255,209,102,0.12)');
+    const age = Math.max(0, (now - tr.t) / 1000);
+    text(age < 60 ? age.toFixed(0) + 's' : (age / 60).toFixed(0) + 'm', x, ry, 12, DIM);
+    text(tr.side.toUpperCase(), x + 40, ry, 12, col, 'left', '700');
+    text(tr.sol.toFixed(2) + ' SOL', x + 90, ry, 12, TXT); text('$' + fmtNum(tr.usd), x + 170, ry, 12, DIM);
+    text(tr.maker, x + w, ry, 12, tr.fly ? '#ffd166' : DIM, 'right');
+  });
+}
+function drawDashboard() {
+  const W = DASH.w, H = DASH.h; G.clearRect(0, 0, W, H);
+  roundRect(0, 0, W, H, 22, 'rgba(7,10,18,0.9)', 'rgba(63,255,200,0.35)');
+  text('AXIOM', 28, 30, 26, '#fff', 'left', '800');
+  G.fillStyle = '#3fffc8'; G.beginPath(); G.moveTo(126, 20); G.lineTo(138, 40); G.lineTo(114, 40); G.closePath(); G.fill();
+  let tx = 176;
+  for (const tb of ['Pulse', 'Trackers', 'Perpetuals', 'Portfolio']) { const on = tb === 'Portfolio'; text(tb, tx, 30, 17, on ? '#fff' : DIM, 'left', on ? '600' : ''); tx += G.measureText(tb).width + 28; }
+  const s = currentChannel && liveStatus[currentChannel];
+  text(tvOn ? `● LIVE  ${(s && s.name) || currentChannel}  ·  ${fmtNum((s && s.viewers) || 0)} viewers` : '○ nobody live', W - 28, 30, 16, tvOn ? UP : DIM, 'right', '600');
+  G.fillStyle = LINE; G.fillRect(16, 56, W - 32, 1);
+  const real = mkt.real, sym = real ? real.symbol : COIN.symbol, name = real ? real.name : COIN.name;
+  G.fillStyle = real ? '#2a2f6a' : '#1c2436'; G.beginPath(); G.arc(52, 100, 26, 0, Math.PI * 2); G.fill();
+  if (real) text((sym || '?')[0].toUpperCase(), 52, 101, 28, '#fff', 'center', '800'); else text('🪰', 52, 102, 30, '#fff', 'center');
+  const DEX = { pumpfun: 'pump.fun', pumpswap: 'PumpSwap', raydium: 'Raydium', meteora: 'Meteora', orca: 'Orca' };
+  const sub = real ? `${name}  ·  ${DEX[real.dex] || real.dex}  ·  ${COIN.mint.slice(0, 4)}…${COIN.mint.slice(-4)}` : COIN.mint ? `loading ${COIN.mint.slice(0, 6)}… ${realError ? '(' + realError + ')' : ''}` : name + '  ·  pump.fun';
+  text(`$${sym}`, 92, 88, 26, '#fff', 'left', '800'); text(sub, 92, 116, 15, DIM);
+  const ref = mkt.candles.length ? mkt.candles[Math.max(0, mkt.candles.length - 60)].o : mkt.price;
+  const chg = real ? real.change5m : (mkt.price / ref - 1) * 100;
+  text(fmtPrice(mkt.price), 300, 92, 34, '#fff', 'left', '800');
+  text(`${chg >= 0 ? '+' : ''}${chg.toFixed(1)}%  5m`, 300, 122, 16, chg >= 0 ? UP : DOWN, 'left', '600');
+  const mcap = real ? real.marketCap : mkt.price * COIN.supply;
+  let sx = 560;
+  const liq = real && !mkt.liqUsd && real.dex === 'pumpfun' ? 'curve' : '$' + fmtNum(mkt.liqUsd);
+  const stats = real
+    ? [['MC', '$' + fmtNum(mcap)], ['Liq', liq], ['Vol 5m', '$' + fmtNum(real.volume5m)], ['Vol 24h', '$' + fmtNum(mkt.vol24)], ['Txns 5m', `${real.buys5m}/${real.sells5m}`], ['SOL', '$' + solUsd.toFixed(0)]]
+    : [['MC', '$' + fmtNum(mcap)], ['Liq', '$' + fmtNum(mkt.liqUsd)], ['Vol 24h', '$' + fmtNum(mkt.vol24)], ['Holders', fmtNum(mkt.holders)], ['SOL', '$' + solUsd.toFixed(0)]];
+  sx = real ? 530 : 560;
+  for (const [k, v] of stats) { text(k, sx, 84, 13, DIM); text(v, sx, 110, 20, k === 'Txns 5m' ? UP : TXT, 'left', '700'); sx += real ? 84 : 92; }
+  G.fillStyle = LINE; G.fillRect(16, 146, W - 32, 1);
+  drawChart(16, 156, 684, 322);
+  drawTrades(716, 156, 292, 322);
+  G.fillStyle = LINE; G.fillRect(16, 488, W - 32, 1);
+  const u = upnl(), uPct = bag.cost > 0 ? u / bag.cost * 100 : 0;
+  text("FLY'S POSITION", 28, 512, 13, DIM, 'left', '700');
+  let cx = 28;
+  for (const [k, v, col] of [
+    ['Balance', bag.sol.toFixed(2) + ' SOL', TXT], ['Holding', fmtNum(bag.tokens) + ' ' + sym, TXT], ['Value', posValueSol().toFixed(2) + ' SOL', TXT],
+    ['Avg entry', bag.tokens ? fmtPrice(avgEntry()) : '—', TXT],
+    ['uPnL', (u >= 0 ? '+' : '') + u.toFixed(2) + ' SOL (' + (uPct >= 0 ? '+' : '') + uPct.toFixed(1) + '%)', u >= 0 ? UP : DOWN],
+    ['Realized', (bag.realized >= 0 ? '+' : '') + bag.realized.toFixed(2) + ' SOL', bag.realized >= 0 ? UP : DOWN],
+  ]) { text(k, cx, 540, 13, DIM); text(v, cx, 566, 19, col, 'left', '700'); cx += k === 'uPnL' ? 230 : 150; }
+  const by = 596; let bx = 28;
+  for (const a of ['0.5', '1', '2', '5']) { roundRect(bx, by, 66, 30, 8, 'rgba(25,210,124,0.18)', 'rgba(25,210,124,0.6)'); text(`Buy ${a}`, bx + 33, by + 15, 14, UP, 'center', '600'); bx += 74; }
+  bx += 16;
+  for (const a of ['25%', '50%', '100%']) { roundRect(bx, by, 70, 30, 8, 'rgba(255,77,109,0.15)', 'rgba(255,77,109,0.55)'); text(`Sell ${a}`, bx + 35, by + 15, 14, DOWN, 'center', '600'); bx += 78; }
+  if (s && s.title) text(s.title.slice(0, 50) + (s.title.length > 50 ? '…' : ''), W - 28, 611, 14, DIM, 'right');
+  dashTex.needsUpdate = true;
+}
+// the eye: glide the camera down to the fly's dashboard, and back to where you were
+let camTween = null, eyeOn = false, savedView = null;
+function tweenCamera(pos, target, dur = 1.4) {
+  camTween = { p0: camera.position.clone(), t0: controls.target.clone(), p1: pos.clone(), t1: target.clone(), start: clock.getElapsedTime(), dur };
+  controls.enabled = false;
+}
+function toggleEye() {
+  if (!eyeOn) {
+    savedView = { pos: camera.position.clone(), target: controls.target.clone() };
+    const center = dash.position.clone();
+    const normal = new THREE.Vector3(0, 0, 1).applyEuler(dash.rotation);   // straight out of the panel's face
+    tweenCamera(center.clone().addScaledVector(normal, 1.0).add(new THREE.Vector3(0.12, 0, 0)), center);
+    eyeOn = true; toast('👁 dashboard view · press again to go back');
+  } else {
+    if (savedView) tweenCamera(savedView.pos, savedView.target);
+    eyeOn = false;
+  }
+  document.getElementById('tbEye').classList.toggle('on', eyeOn);
 }
 addEventListener('keydown', e => {
-  if (e.key === 't' || e.key === 'T') setTvMode(!tvMode);
+  if (e.key === 't' || e.key === 'T') cycleQuality();
+  if (e.key === 'e' || e.key === 'E') toggleEye();
   if (e.key === 'f' || e.key === 'F') startFlight();
-  if (e.key === 'n' || e.key === 'N') skipVideo();
+  if (e.key === 'n' || e.key === 'N') hopNow();
   if (e.key === 'b' || e.key === 'B') brainVisible = !brainVisible;
+  if (e.key === 'd' || e.key === 'D') { dashVisible = !dashVisible; dash.visible = dashBeam.visible = dashLight.visible = dashVisible; }
   if (e.key === 'm' || e.key === 'M') setMuted(!muted);
 });
 setTimeout(() => document.getElementById('hint').classList.add('fade'), 12000);
@@ -730,8 +1044,9 @@ setTimeout(() => document.getElementById('hint').classList.add('fade'), 12000);
 // touch bar (phones/tablets)
 const tb = id => document.getElementById(id);
 tb('tbSound').onclick = () => setMuted(soundOn ? !muted : false);
-tb('tbNext').onclick = skipVideo;
-tb('tbTv').onclick = () => { setTvMode(!tvMode); tb('tbTv').classList.toggle('on', tvMode); };
+tb('tbNext').onclick = hopNow;
+tb('tbTv').onclick = cycleQuality;
+tb('tbEye').onclick = toggleEye;
 tb('tbBrain').onclick = () => { brainVisible = !brainVisible; tb('tbBrain').classList.toggle('on', !brainVisible); };
 tb('tbFly').onclick = () => startFlight();
 
@@ -801,16 +1116,25 @@ function brainTargets(stateKey) {
     case 'takeoff': return { escape: 1, visual: 0.5 };
     case 'flying': return { steer: 1, flow: 0.9, visual: 0.5 };
     case 'hover': return { smell: 1, reward: 0.8, steer: 0.35 };
-    case 'watching': return { visual: 1, flow: 0.6 };
-    case 'live': return { visual: 1, flow: 0.6, reward: 0.8 };
+    case 'watching': {   // watching a streamer while holding a bag: the PnL colours the dopamine
+      const pct = bag.cost > 0 ? upnl() / bag.cost * 100 : 0;
+      return { visual: 1, flow: 0.6, reward: Math.min(0.8, Math.max(0, pct / 15)), punish: Math.min(0.8, Math.max(0, -pct / 15)) };
+    }
+    case 'ape': return { reward: 0.9, steer: 0.5, visual: 0.4 };
+    case 'win': return { reward: 1, visual: 0.3 };
+    case 'rekt': return { punish: 1, escape: 0.3, visual: 0.3 };
     default: return { clock: 0.6, punish: 0.25 };
   }
 }
-const STATE_TEXT = {
-  takeoff: 'TAKEOFF · giant-fiber escape circuit', flying: 'FLYING · steering + optic-flow neurons',
-  hover: 'SNIFFING THE FRUIT BOWL · olfactory + dopamine reward', watching: 'WATCHING TV · visual system',
-  live: 'WATCHING THE LIVE STREAM · visual system + dopamine', idle: 'RESTING · circadian clock',
-};
+function stateText(key) {
+  const who = currentChannel && liveStatus[currentChannel] ? liveStatus[currentChannel].name : currentChannel;
+  return {
+    takeoff: 'TAKEOFF · giant-fiber escape circuit', flying: 'FLYING · steering + optic-flow neurons',
+    hover: 'SNIFFING THE FRUIT BOWL · olfactory + dopamine reward', watching: `WATCHING ${(who || 'THE STREAM').toUpperCase()} TRADE · visual system`,
+    ape: 'APING IN · dopamine + descending command', win: 'TAKING PROFIT · dopamine reward', rekt: 'STOPPED OUT · aversive dopamine',
+    idle: 'RESTING · circadian clock',
+  }[key] || key;
+}
 const labelCanvas = document.createElement('canvas'); labelCanvas.width = 1024; labelCanvas.height = 192;
 const labelTex = new THREE.CanvasTexture(labelCanvas); labelTex.colorSpace = THREE.SRGBColorSpace;
 const label = new THREE.Sprite(new THREE.SpriteMaterial({ map: labelTex, transparent: true, depthWrite: false }));
@@ -821,7 +1145,7 @@ function drawLabel(stateKey, actives) {
   const g = labelCanvas.getContext('2d'); g.clearRect(0, 0, 1024, 192);
   g.fillStyle = 'rgba(4,10,22,0.6)'; g.beginPath(); g.roundRect(0, 0, 1024, 192, 26); g.fill();
   g.textAlign = 'center'; g.textBaseline = 'middle';
-  g.fillStyle = '#9fe6ff'; g.font = 'bold 42px system-ui, sans-serif'; g.fillText(STATE_TEXT[stateKey] || stateKey, 512, 50);
+  g.fillStyle = '#9fe6ff'; g.font = 'bold 42px system-ui, sans-serif'; g.fillText(stateText(stateKey), 512, 50);
   g.fillStyle = '#ffffff'; g.font = '34px system-ui, sans-serif'; g.fillText(actives.join('  ·  ') || '…loading neurons', 512, 104);
   g.fillStyle = 'rgba(255,255,255,0.55)'; g.font = '25px system-ui, sans-serif'; g.fillText('FlyWire whole-brain connectome (FAFB) · neurons via Virtual Fly Brain · JRC2018U template', 512, 156);
   labelTex.needsUpdate = true;
@@ -835,8 +1159,10 @@ function updateBrain(t, dt) {
   label.position.y = brainGroup.position.y + 0.36;
   if (!brainRig.visible) return;
 
-  const watching = flyPhase === 'sitting' && tvOn && (playerState === 1 || playerState === 3);
-  const stateKey = flyPhase !== 'sitting' ? flyPhase : (watching ? (mode === 'live' ? 'live' : 'watching') : 'idle');
+  let stateKey;
+  if (flyPhase !== 'sitting') stateKey = flyPhase;
+  else if (lastTrade && t - lastTrade.t < 2.5) stateKey = lastTrade.kind;
+  else stateKey = (tvOn && tvPlaying) ? 'watching' : 'idle';
   const T = brainTargets(stateKey);
   const actives = new Set(); let peak = 0;
   for (const n of neuronObjs) {
@@ -873,41 +1199,65 @@ function updateBrain(t, dt) {
   sparkGeo.attributes.position.needsUpdate = true; sparkGeo.attributes.color.needsUpdate = true;
 }
 
-// start watching the channel
-checkLive();
-setInterval(checkLive, CHECK_EVERY_SECONDS * 1000);
-document.addEventListener('visibilitychange', () => { if (!document.hidden) checkLive(); });
+// start: find out who is live, then keep checking and hopping
+checkStreams();
+every(checkStreams, CHECK_EVERY_SECONDS * 1000);
+setInterval(() => { if (tvOn && liveList().length > 1 && performance.now() > nextHopAt) decide(); }, 5000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) checkStreams(); });
 
 // small handle for tinkering from the console
-window.flyTV = { camera, controls, fly, startFlight, checkLive, playLive, nextBinge, setTvMode, enableSound, neuronObjs, state: () => ({ mode, currentVideo, bingeVideo, playerState, playlist: playlist.length, soundOn, flyPhase, brainLoaded, neurons: neuronObjs.map(n => [n.def.name, n.parent.length, +n.act.toFixed(2)]) }) };
+window.flyTV = { camera, controls, fly, startFlight, checkStreams, switchTo, hopNow, loadChannel, cycleQuality, enableSound, setMuted, video, neuronObjs, mkt, bag, flyTrade,
+  state: () => ({ currentChannel, tvOn, tvPlaying, helperOk, liveStatus, soundOn, muted, flyPhase, brainLoaded, price: mkt.price, candles: mkt.candles.length, trades: mkt.trades.length, bag: { ...bag }, lastTrade, neurons: neuronObjs.map(n => [n.def.name, n.parent.length, +n.act.toFixed(2)]) }) };
 
 // ---------------------------------------------------------------- loop
 const clock = new THREE.Clock();
-let last = 0;
+let last = 0, frameNo = 0, nextTvSample = 0;
+const tvSampleCanvas = document.createElement('canvas'); tvSampleCanvas.width = 8; tvSampleCanvas.height = 5;
+const tvSampleCtx = tvSampleCanvas.getContext('2d', { willReadFrequently: true });
+const tvTargetCol = new THREE.Color(0x8fb0ff);
 function frame() {
   requestAnimationFrame(frame);
   const t = clock.getElapsedTime(); const dt = Math.min(0.05, t - last); last = t;
 
   animateFly(t, dt);
   updateBrain(t, dt);
+  tickMarket(t, dt);
+  if (dashVisible && frameNo++ % (LOW ? 12 : 6) === 0) drawDashboard();
+  dashLight.intensity = 0.7 + Math.sin(t * 2.3) * 0.15 + (lastTrade && t - lastTrade.t < 1 ? 1.2 : 0);
 
-  if (tvOn) {
-    tvLight.intensity = 5.5 + Math.sin(t * 13) * 1.2 + Math.sin(t * 37) * 0.7 + Math.sin(t * 2.1) * 0.8;
-    tvLight.color.setHSL(0.58 + Math.sin(t * 0.6) * 0.14, 0.55, 0.62);
+  // the TV lights the room with whatever colour is on screen
+  if (tvOn && tvPlaying) {
+    if (t > nextTvSample) {
+      nextTvSample = t + 0.25;
+      try {
+        tvSampleCtx.drawImage(video, 0, 0, 8, 5);
+        const d = tvSampleCtx.getImageData(0, 0, 8, 5).data; let r = 0, g = 0, b = 0;
+        for (let i = 0; i < d.length; i += 4) { r += d[i]; g += d[i + 1]; b += d[i + 2]; }
+        const n = d.length / 4; tvTargetCol.setRGB(r / n / 255, g / n / 255, b / n / 255);
+      } catch {}
+    }
+    tvLight.color.lerp(tvTargetCol, 0.1);
+    const lum = 0.3 * tvTargetCol.r + 0.59 * tvTargetCol.g + 0.11 * tvTargetCol.b;
+    tvLight.intensity = 3 + lum * 7 + Math.sin(t * 23) * 0.3;
   } else {
     tvLight.intensity = 2.2 + Math.sin(t * 8) * 0.3;
     tvLight.color.setHSL(0.6, 0.5, 0.6);
   }
 
+  if (camTween) {
+    const k = Math.min(1, (t - camTween.start) / camTween.dur), e = easeInOut(k);
+    camera.position.lerpVectors(camTween.p0, camTween.p1, e);
+    controls.target.lerpVectors(camTween.t0, camTween.t1, e);
+    if (k >= 1) { camTween = null; controls.enabled = true; }
+  }
   controls.update();
   glRenderer.render(scene, camera);
-  cssRenderer.render(scene, camera);
 }
 frame();
 
 addEventListener('resize', () => {
   fitFov();
-  glRenderer.setSize(innerWidth, innerHeight); cssRenderer.setSize(innerWidth, innerHeight);
+  glRenderer.setSize(innerWidth, innerHeight);
 });
 </script>
 </body>
