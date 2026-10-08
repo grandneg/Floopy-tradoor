@@ -539,6 +539,13 @@ class Handler(SimpleHTTPRequestHandler):
             return self._file(PAGE, "text/html; charset=utf-8", "public, max-age=0, s-maxage=120")
         if parsed.path == "/healthz":
             return self._text(b"ok")
+        # site icon + social preview images, from the logo/ folder next to this file
+        asset = {"/favicon.ico": "favicon-32.png", "/favicon.png": "favicon-32.png", "/apple-touch-icon.png": "apple-touch-icon.png",
+                 "/og.png": "og-1200x630.png", "/logo.png": "fly-logo-256.png", "/logo.svg": "fly-logo.svg",
+                 "/banner.png": "floopytradoor-banner-1500x500.png", "/pfp.png": "floopytradoor-pfp-1024.png"}.get(parsed.path)
+        if asset:
+            ctype = "image/svg+xml" if asset.endswith(".svg") else "image/png"
+            return self._file(os.path.join(HERE, "logo", asset), ctype, "public, max-age=86400, s-maxage=604800")
         m = re.fullmatch(r"/hls/([a-z0-9_]{1,25})/(\d{2,4})\.m3u8", parsed.path)
         if m:   # the live playlist, relayed for the viewer (see hls_playlist)
             login, height = m.group(1), m.group(2)
@@ -598,7 +605,7 @@ class Handler(SimpleHTTPRequestHandler):
             with open(path, "rb") as f:
                 body = f.read()
         except OSError:
-            return self._json({"error": "page missing"}, 500)
+            return self._json({"error": "file missing"}, 404)
         self._text(body, ctype, 200, cache)
 
     def log_message(self, fmt, *args):  # keep the console quiet: only report errors on static files

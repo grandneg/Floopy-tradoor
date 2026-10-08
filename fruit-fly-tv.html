@@ -5,8 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="theme-color" content="#07060c">
-<title>Fruit Fly TV</title>
-<link rel="icon" href="data:,">
+<title>floopytradoor</title>
+<meta name="description" content="A fruit fly with a real connectome brain, trading his coin on a hologram while watching live Solana traders on a 3D TV.">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<!-- link preview card on X, Telegram, Discord, iMessage… -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="floopytradoor">
+<meta property="og:title" content="floopytradoor">
+<meta property="og:description" content="A fruit fly with a real connectome brain, trading his coin on a hologram while watching live Solana traders on a 3D TV.">
+<meta property="og:url" content="https://floopytradoor.fun/">
+<meta property="og:image" content="https://floopytradoor.fun/og.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="floopytradoor">
+<meta name="twitter:description" content="A fruit fly with a real connectome brain, trading his coin on a hologram while watching live Solana traders on a 3D TV.">
+<meta name="twitter:image" content="https://floopytradoor.fun/og.png">
 <style>
   :root { color-scheme: dark; }
   html, body { margin:0; height:100%; overflow:hidden; background:#07060c; font-family: system-ui, -apple-system, Segoe UI, sans-serif; color:#eee; overscroll-behavior:none; -webkit-user-select:none; user-select:none; -webkit-tap-highlight-color:transparent; }
@@ -581,7 +596,7 @@ function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); 
 
 // ---------------------------------------------------------------- Twitch: who is live, channel hopping
 // no on-screen panel: the status goes into the window title instead
-function setStatus(kind, text) { document.title = (kind === 'live' ? '🔴 ' : '') + text; }
+function setStatus(kind, text) { document.title = 'floopytradoor · ' + (kind === 'live' ? '🔴 ' : '') + text; }
 const fmtTime = d => d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 const fmtNum = n => n >= 1e9 ? (n / 1e9).toFixed(2) + 'B' : n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'K' : String(Math.round(n));
 
